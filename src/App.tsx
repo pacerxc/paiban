@@ -9,6 +9,9 @@ import PeopleView from './components/PeopleView'
 import PostsView from './components/PostsView'
 import LeaveView from './components/LeaveView'
 import DataView from './components/DataView'
+import ThemeSwitcher from './components/ThemeSwitcher'
+
+type Theme = 'warm' | 'ocean' | 'dark'
 
 const TABS = [
   { id: 'week', label: '周看板' },
@@ -27,10 +30,18 @@ export default function App() {
   const [tab, setTab] = useState<TabId>('week')
   const [weekStart, setWeekStart] = useState(() => startOfWeek(toISO(new Date())))
   const [month, setMonth] = useState(currentMonth)
+  const [theme, setTheme] = useState<Theme>(
+    () => (localStorage.getItem('paiban.theme') as Theme) || 'warm',
+  )
 
   useEffect(() => {
     saveData(data)
   }, [data])
+
+  useEffect(() => {
+    document.body.dataset.theme = theme
+    localStorage.setItem('paiban.theme', theme)
+  }, [theme])
 
   const activeCount = data.people.filter((p) => p.active).length
   const capacity = data.posts.reduce((sum, p) => sum + p.capacity, 0)
@@ -46,16 +57,19 @@ export default function App() {
               <p>{data.settings.orgName} · 轮转排班 · 拖拽换班 · 休假台账</p>
             </div>
           </div>
-          <div className="header-stats">
-            <span>
-              <b>{activeCount}</b> 在岗
-            </span>
-            <span>
-              <b>{data.posts.length}</b> 岗位
-            </span>
-            <span>
-              <b>{capacity}</b> 岗位需求
-            </span>
+          <div className="header-right">
+            <div className="header-stats">
+              <span>
+                <b>{activeCount}</b> 在岗
+              </span>
+              <span>
+                <b>{data.posts.length}</b> 岗位
+              </span>
+              <span>
+                <b>{capacity}</b> 岗位需求
+              </span>
+            </div>
+            <ThemeSwitcher theme={theme} onChange={setTheme} />
           </div>
         </div>
         <nav className="tabs">
