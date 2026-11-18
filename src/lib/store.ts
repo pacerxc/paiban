@@ -1,7 +1,7 @@
-import type { AppData, LeaveRecord, LedgerEntry, Person, Post, WeekPlan } from '../types'
+import type { AppData, DayState, LeaveRecord, LedgerEntry, Person, Post } from '../types'
 import { startOfWeek, toISO } from './date'
 
-const STORAGE_KEY = 'paiban.data.v1'
+const STORAGE_KEY = 'paiban.data.v2'
 
 export const POST_COLORS = [
   '#0e7c66',
@@ -11,29 +11,71 @@ export const POST_COLORS = [
   '#b0446a',
   '#3f7a3f',
   '#8a6a2f',
-  '#466a7a',
 ]
 
 export function uid(prefix: string): string {
   return `${prefix}_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 7)}`
 }
 
-const SEED_NAMES = [
-  '张伟', '王芳', '李娜', '刘洋', '陈静',
-  '杨帆', '赵磊', '黄敏', '周杰', '吴迪',
-  '徐强', '孙丽', '马超', '朱琳', '胡军',
-  '郭婷', '何平', '高翔', '林雪', '罗鹏',
+const SEED_POSTS: Array<[string, number]> = [
+  ['一号台', 1],
+  ['受理', 2],
+  ['校对', 2],
+  ['扫描', 1],
+  ['机动', 3],
+  ['拍照', 1],
+  ['填表', 1],
 ]
 
-const SEED_POSTS: Array<[string, number]> = [
-  ['前台', 3],
-  ['咨询', 3],
-  ['收费', 2],
-  ['药房', 3],
-  ['检验', 2],
-  ['影像', 2],
-  ['治疗', 3],
-  ['后勤', 2],
+interface SeedPerson {
+  name: string
+  note?: string
+  saturdayOnly?: boolean
+  fixedPostIndex?: number
+  allowedPostIndexes?: number[]
+}
+
+const SEED_PEOPLE: SeedPerson[] = [
+  { name: '朱婕' },
+  { name: '杨雯' },
+  { name: '杨娟' },
+  { name: '汪甜' },
+  {
+    name: '查云',
+    saturdayOnly: true,
+    allowedPostIndexes: [0, 6],
+    note: '周六专属，只排一号台 / 填表',
+  },
+  {
+    name: '颜贞贞',
+    fixedPostIndex: 5,
+    allowedPostIndexes: [5],
+    note: '固定拍照岗，休息时由组内其他人替补',
+  },
+  { name: '林丽雯' },
+  { name: '耿园园' },
+  { name: '周娟' },
+  { name: '陈静静' },
+  {
+    name: '艾丽娜',
+    saturdayOnly: true,
+    allowedPostIndexes: [0, 6],
+    note: '周六专属，只排一号台 / 填表',
+  },
+  { name: '王玉花' },
+  {
+    name: '唐小雨',
+    saturdayOnly: true,
+    allowedPostIndexes: [0, 6],
+    note: '周六专属，只排一号台 / 填表',
+  },
+  {
+    name: '顾彬彬',
+    saturdayOnly: true,
+    allowedPostIndexes: [0, 6],
+    note: '周六专属，只排一号台 / 填表',
+  },
+  { name: '贺夏炎' },
 ]
 
 export function seedData(): AppData {
@@ -43,21 +85,29 @@ export function seedData(): AppData {
     capacity,
     color: POST_COLORS[i % POST_COLORS.length],
   }))
-  const people: Person[] = SEED_NAMES.map((name, i) => ({
+
+  const people: Person[] = SEED_PEOPLE.map((seed, i) => ({
     id: `person_${i + 1}`,
-    name,
+    name: seed.name,
     order: i + 1,
-    allowedPostIds: null,
+    allowedPostIds: seed.allowedPostIndexes
+      ? seed.allowedPostIndexes.map((idx) => `post_${idx + 1}`)
+      : null,
+    saturdayOnly: seed.saturdayOnly === true,
+    fixedPostId: seed.fixedPostIndex !== undefined ? `post_${seed.fixedPostIndex + 1}` : null,
     active: true,
+    note: seed.note,
   }))
+
   return {
-    version: 1,
+    version: 2,
     settings: { orgName: '综合班组', startDate: startOfWeek(toISO(new Date())) },
     people,
     posts,
+    days: {},
+    dayPosts: {},
     leaves: [],
     ledger: [],
-    weeks: {},
   }
 }
 
@@ -66,9 +116,10 @@ export function blankData(current: AppData): AppData {
   return {
     ...current,
     people: [],
+    days: {},
+    dayPosts: {},
     leaves: [],
     ledger: [],
-    weeks: {},
   }
 }
 
@@ -84,6 +135,8 @@ export function normalize(input: Raw): AppData {
         name: String(p.name ?? '未命名'),
         order: Number(p.order ?? i + 1) || i + 1,
         allowedPostIds: Array.isArray(p.allowedPostIds) ? p.allowedPostIds.map(String) : null,
+        saturdayOnly: p.saturdayOnly === true,
+        fixedPostId: p.fixedPostId ? String(p.fixedPostId) : null,
         active: p.active !== false,
         note: p.note ? String(p.note) : undefined,
       }))
@@ -97,6 +150,20 @@ export function normalize(input: Raw): AppData {
         color: String(p.color ?? POST_COLORS[i % POST_COLORS.length]),
       }))
     : seed.posts
+
+  const days: Record<string, DayState> = {}
+  if (source.days && typeof source.days === 'object') {
+    for (const [date, state] of Object.entries(source.days as Record<string, unknown>)) {
+      if (state === 'work' || state === 'off') days[date] = state
+    }
+  }
+
+  const dayPosts: Record<string, string> = {}
+  if (source.dayPosts && typeof source.dayPosts === 'object') {
+    for (const [key, postId] of Object.entries(source.dayPosts as Record<string, unknown>)) {
+      if (typeof postId === 'string') dayPosts[key] = postId
+    }
+  }
 
   const leaves: LeaveRecord[] = Array.isArray(source.leaves)
     ? source.leaves
@@ -125,31 +192,18 @@ export function normalize(input: Raw): AppData {
         }))
     : []
 
-  const weeks: Record<string, WeekPlan> = {}
-  if (source.weeks && typeof source.weeks === 'object') {
-    for (const [key, value] of Object.entries(source.weeks as Record<string, Raw>)) {
-      if (!value || typeof value !== 'object') continue
-      const manual: Record<string, string> = {}
-      if (value.manual && typeof value.manual === 'object') {
-        for (const [personId, postId] of Object.entries(value.manual as Record<string, unknown>)) {
-          if (typeof postId === 'string') manual[personId] = postId
-        }
-      }
-      if (Object.keys(manual).length > 0) weeks[key] = { weekStart: String(value.weekStart ?? key), manual }
-    }
-  }
-
   return {
-    version: 1,
+    version: 2,
     settings: {
       orgName: String(source.settings?.orgName ?? seed.settings.orgName),
       startDate: String(source.settings?.startDate ?? seed.settings.startDate),
     },
     people,
     posts,
+    days,
+    dayPosts,
     leaves,
     ledger,
-    weeks,
   }
 }
 

@@ -76,3 +76,10 @@ export function monthWeeks(month: string): string[] {
 export function weekdayLabel(iso: string): string {
   return ['周日', '周一', '周二', '周三', '周四', '周五', '周六'][parseISO(iso).getDay()]
 }
+
+/** 某个月的全部日期（1 号到月末） */
+export function monthDates(month: string): string[] {
+  const [y, m] = month.split('-').map(Number)
+  const total = new Date(y, m, 0).getDate()
+  return Array.from({ length: total }, (_, i) => `${month}-${pad(i + 1)}`)
+}

@@ -4,14 +4,16 @@ import { loadData, saveData } from './lib/store'
 import { currentMonth, startOfWeek, toISO } from './lib/date'
 import WeekView from './components/WeekView'
 import MonthView from './components/MonthView'
+import PersonMonth from './components/PersonMonth'
 import PeopleView from './components/PeopleView'
 import PostsView from './components/PostsView'
 import LeaveView from './components/LeaveView'
 import DataView from './components/DataView'
 
 const TABS = [
-  { id: 'week', label: '周排班' },
-  { id: 'month', label: '月度总览' },
+  { id: 'week', label: '周看板' },
+  { id: 'month', label: '月看板' },
+  { id: 'personMonth', label: '人员月历' },
   { id: 'people', label: '人员' },
   { id: 'posts', label: '岗位' },
   { id: 'leave', label: '休假与台账' },
@@ -41,7 +43,7 @@ export default function App() {
             <div className="brand-mark">排</div>
             <div>
               <h1>排班台</h1>
-              <p>{data.settings.orgName} · 轮转排班与休假台账</p>
+              <p>{data.settings.orgName} · 轮转排班 · 拖拽换班 · 休假台账</p>
             </div>
           </div>
           <div className="header-stats">
@@ -73,7 +75,12 @@ export default function App() {
         {tab === 'week' && (
           <WeekView data={data} weekStart={weekStart} onWeekChange={setWeekStart} setData={setData} />
         )}
-        {tab === 'month' && <MonthView data={data} month={month} onMonthChange={setMonth} />}
+        {tab === 'month' && (
+          <MonthView data={data} month={month} onMonthChange={setMonth} setData={setData} />
+        )}
+        {tab === 'personMonth' && (
+          <PersonMonth data={data} month={month} onMonthChange={setMonth} />
+        )}
         {tab === 'people' && <PeopleView data={data} setData={setData} />}
         {tab === 'posts' && <PostsView data={data} setData={setData} />}
         {tab === 'leave' && <LeaveView data={data} setData={setData} />}

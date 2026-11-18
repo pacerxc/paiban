@@ -120,7 +120,7 @@ export default function DataView({ data, setData, month, onMonthChange }: Props)
             </div>
           </div>
           <p className="muted" style={{ marginBottom: 0 }}>
-            起始周会自动对齐到所在周的周一，之后每周按顺序自动顺移一位。
+            起始周会自动对齐到所在周的周一。每周整体顺移一位，换班只改当天。
           </p>
         </section>
 
@@ -156,7 +156,7 @@ export default function DataView({ data, setData, month, onMonthChange }: Props)
               />
             </label>
             <button className="btn ghost" onClick={resetSeed}>
-              重置为示例数据
+              恢复默认名单与岗位
             </button>
             <button className="btn danger" onClick={clearAll}>
               清空人员与记录
@@ -173,18 +173,15 @@ export default function DataView({ data, setData, month, onMonthChange }: Props)
       </div>
       <div className="card pad">
         <ol className="help-list">
+          <li>在「人员」页维护名单、轮转顺序，可设置只能上的岗位、固定岗位（如拍照）和只排周六。</li>
+          <li>「岗位」页设置每个岗位每天需要几个人；工作日岗位需求之和应与常规在岗人数一致。</li>
           <li>
-            在「人员」页维护名单和轮转顺序，可限制某人只能上指定岗位。
+            「周看板」「月看板」可以直接拖动姓名换班：拖到另一个姓名上是当天对调，拖到空缺处是补位；不合规则时目标变红，上方固定区域会写明违反了哪一条。
           </li>
-          <li>
-            在「岗位」页设置每个岗位固定需要几个人，岗位需求之和应与在岗人数一致。
-          </li>
-          <li>「周排班」按周一自动轮转，可临时手动换岗；手动结果只对本周生效。</li>
-          <li>
-            「休假与台账」登记调休/补休，可同步扣减额度；余额为负说明欠休。
-          </li>
-          <li>用「复制文本」把本周排班发到群里，用「打印」生成纸质表。</li>
-          <li>数据保存在浏览器 localStorage，清理浏览器数据会丢失，请定期导出备份。</li>
+          <li>点日期下方的「上班 / 放假」可临时调整某一天；换班与放假都只影响当天，后续周次继续按轮转顺序。</li>
+          <li>「人员月历」按人查看整月每天在哪个岗位，并自动统计上班、休假、休息天数。</li>
+          <li>「休假与台账」登记调休 / 补休，可同步扣减额度；余额为负说明欠休。</li>
+          <li>数据保存在浏览器 localStorage，清理浏览器数据会丢失，请定期导出 JSON 备份。</li>
         </ol>
       </div>
     </div>

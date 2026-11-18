@@ -37,6 +37,8 @@ export default function PeopleView({ data, setData }: Props) {
           name: trimmed,
           order: maxOrder + 1,
           allowedPostIds: null,
+          saturdayOnly: false,
+          fixedPostId: null,
           active: true,
         },
       ],
@@ -59,20 +61,18 @@ export default function PeopleView({ data, setData }: Props) {
   function removePerson(id: string) {
     const person = data.people.find((p) => p.id === id)
     if (!person) return
-    if (!confirm(`删除「${person.name}」？相关的休假记录和台账也会一起删除。`)) return
+    if (!confirm(`删除「${person.name}」？相关的休假记录、台账和换班记录也会一起删除。`)) return
     setData((prev) => {
-      const weeks: AppData['weeks'] = {}
-      for (const [key, plan] of Object.entries(prev.weeks)) {
-        const manual = { ...plan.manual }
-        delete manual[id]
-        if (Object.keys(manual).length > 0) weeks[key] = { ...plan, manual }
+      const dayPosts: Record<string, string> = {}
+      for (const [key, value] of Object.entries(prev.dayPosts)) {
+        if (!key.endsWith(`|${id}`)) dayPosts[key] = value
       }
       return {
         ...prev,
         people: prev.people.filter((p) => p.id !== id),
         leaves: prev.leaves.filter((l) => l.personId !== id),
         ledger: prev.ledger.filter((e) => e.personId !== id),
-        weeks,
+        dayPosts,
       }
     })
   }
@@ -85,6 +85,13 @@ export default function PeopleView({ data, setData }: Props) {
       : [...base, postId]
     update(person.id, {
       allowedPostIds: next.length === data.posts.length ? null : next,
+    })
+  }
+
+  function setFixedPost(person: Person, postId: string) {
+    update(person.id, {
+      fixedPostId: postId || null,
+      allowedPostIds: postId ? [postId] : person.allowedPostIds,
     })
   }
 
@@ -114,17 +121,18 @@ export default function PeopleView({ data, setData }: Props) {
       </div>
 
       {people.length === 0 ? (
-        <div className="card empty">还没有人员，先添加名单，再回到「周排班」查看轮转结果。</div>
+        <div className="card empty">还没有人员，先添加名单，再回到「周看板」查看轮转结果。</div>
       ) : (
         <div className="table-wrap">
           <table>
             <thead>
               <tr>
-                <th style={{ width: 56 }}>顺序</th>
-                <th style={{ minWidth: 120 }}>姓名</th>
-                <th style={{ minWidth: 260 }}>只能上的岗位</th>
-                <th style={{ width: 90 }}>在岗</th>
-                <th style={{ width: 120 }}>调整</th>
+                <th style={{ width: 60 }}>顺序</th>
+                <th style={{ minWidth: 110 }}>姓名</th>
+                <th style={{ minWidth: 230 }}>只能上的岗位</th>
+                <th style={{ minWidth: 120 }}>固定岗位</th>
+                <th style={{ width: 100 }}>只排周六</th>
+                <th style={{ width: 80 }}>在岗</th>
                 <th style={{ width: 70 }}>操作</th>
               </tr>
             </thead>
@@ -160,12 +168,18 @@ export default function PeopleView({ data, setData }: Props) {
                         value={person.name}
                         onChange={(e) => update(person.id, { name: e.target.value })}
                       />
+                      {person.note && (
+                        <div className="muted" style={{ fontSize: 11 }}>
+                          {person.note}
+                        </div>
+                      )}
                     </td>
                     <td>
-                      <div className="chips">
+                      <div className={person.fixedPostId ? 'chips disabled' : 'chips'}>
                         <button
                           className={all ? 'chip on' : 'chip'}
                           onClick={() => update(person.id, { allowedPostIds: null })}
+                          disabled={!!person.fixedPostId}
                         >
                           全部岗位
                         </button>
@@ -176,17 +190,48 @@ export default function PeopleView({ data, setData }: Props) {
                               key={post.id}
                               className={on ? 'chip on' : 'chip'}
                               onClick={() => toggleAllowed(person, post.id)}
+                              disabled={!!person.fixedPostId}
                             >
                               {post.name}
                             </button>
                           )
                         })}
                       </div>
-                      {!all && person.allowedPostIds!.length === 0 && (
-                        <div className="badge danger" style={{ marginTop: 6 }}>
-                          未选择任何岗位，将无法排班
+                      {person.fixedPostId ? (
+                        <div className="muted" style={{ fontSize: 11, marginTop: 4 }}>
+                          已固定岗位，其他岗位限制暂不生效
                         </div>
+                      ) : (
+                        !all &&
+                        person.allowedPostIds!.length === 0 && (
+                          <div className="badge danger" style={{ marginTop: 6 }}>
+                            未选择任何岗位，将无法排班
+                          </div>
+                        )
                       )}
+                    </td>
+                    <td>
+                      <select
+                        value={person.fixedPostId ?? ''}
+                        onChange={(e) => setFixedPost(person, e.target.value)}
+                      >
+                        <option value="">不固定</option>
+                        {data.posts.map((post) => (
+                          <option key={post.id} value={post.id}>
+                            {post.name}
+                          </option>
+                        ))}
+                      </select>
+                    </td>
+                    <td>
+                      <label className="switch">
+                        <input
+                          type="checkbox"
+                          checked={person.saturdayOnly}
+                          onChange={(e) => update(person.id, { saturdayOnly: e.target.checked })}
+                        />
+                        <span>{person.saturdayOnly ? '仅周六' : '否'}</span>
+                      </label>
                     </td>
                     <td>
                       <label className="switch">
@@ -197,24 +242,6 @@ export default function PeopleView({ data, setData }: Props) {
                         />
                         <span>{person.active ? '在岗' : '停用'}</span>
                       </label>
-                    </td>
-                    <td>
-                      <div className="btn-group">
-                        <button
-                          className="btn ghost sm"
-                          onClick={() => move(person.id, -1)}
-                          disabled={i === 0}
-                        >
-                          上移
-                        </button>
-                        <button
-                          className="btn ghost sm"
-                          onClick={() => move(person.id, 1)}
-                          disabled={i === people.length - 1}
-                        >
-                          下移
-                        </button>
-                      </div>
                     </td>
                     <td>
                       <button className="btn danger sm" onClick={() => removePerson(person.id)}>
@@ -230,7 +257,7 @@ export default function PeopleView({ data, setData }: Props) {
       )}
 
       <p className="muted" style={{ marginTop: 12 }}>
-        顺序决定轮转次序：每周所有人按此顺序整体后移一位。点击岗位标签可以限制某人只能上指定岗位，未限制的默认全部可上。
+        顺序决定轮转次序：每周所有人按此顺序整体顺移一位。固定岗位适合拍照这类专人岗，本人休息时同组其他人可以替补；「只排周六」适合周末填表组，只会在周六被安排到其允许的岗位上。
       </p>
     </div>
   )

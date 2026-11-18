@@ -47,23 +47,23 @@ export default function PostsView({ data, setData }: Props) {
   function removePost(id: string) {
     const post = data.posts.find((p) => p.id === id)
     if (!post) return
-    if (!confirm(`删除岗位「${post.name}」？相关的手动排班指定会一并清除。`)) return
+    if (!confirm(`删除岗位「${post.name}」？相关的换班记录会一并清除。`)) return
     setData((prev) => {
-      const weeks: AppData['weeks'] = {}
-      for (const [key, plan] of Object.entries(prev.weeks)) {
-        const manual: Record<string, string> = {}
-        for (const [personId, postId] of Object.entries(plan.manual)) {
-          if (postId !== id) manual[personId] = postId
-        }
-        if (Object.keys(manual).length > 0) weeks[key] = { ...plan, manual }
+      const dayPosts: Record<string, string> = {}
+      for (const [key, postId] of Object.entries(prev.dayPosts)) {
+        if (postId !== id) dayPosts[key] = postId
       }
       return {
         ...prev,
         posts: prev.posts.filter((p) => p.id !== id),
-        weeks,
-        people: prev.people.map((p) =>
-          p.allowedPostIds ? { ...p, allowedPostIds: p.allowedPostIds.filter((pid) => pid !== id) } : p,
-        ),
+        dayPosts,
+        people: prev.people.map((p) => ({
+          ...p,
+          allowedPostIds: p.allowedPostIds
+            ? p.allowedPostIds.filter((pid) => pid !== id)
+            : p.allowedPostIds,
+          fixedPostId: p.fixedPostId === id ? null : p.fixedPostId,
+        })),
       }
     })
   }
@@ -99,6 +99,7 @@ export default function PostsView({ data, setData }: Props) {
               差 {Math.abs(totalCapacity - activeCount)} 人
             </span>
           )}
+          <span style={{ marginLeft: 8 }}>（周六另有 1 名填表组人员上岗）</span>
         </div>
       </div>
 
@@ -162,7 +163,7 @@ export default function PostsView({ data, setData }: Props) {
       )}
 
       <p className="muted" style={{ marginTop: 12 }}>
-        岗位需求人数之和最好与在岗人数一致，否则周排班会出现「空缺」或「待定」人员。人员减少时先调整岗位需求。
+        岗位需求人数之和应与工作日可排人员数一致。新增「填表」这类岗位后，周六会由填表组轮 1 人上岗；如需调整岗位，直接在「周看板」拖动姓名即可。
       </p>
     </div>
   )

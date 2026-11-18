@@ -5,6 +5,10 @@ export interface Person {
   order: number
   /** null 表示可以上全部岗位，否则只允许数组内的岗位 */
   allowedPostIds: string[] | null
+  /** 只排周六（周六专属人员） */
+  saturdayOnly: boolean
+  /** 固定岗位：只排这一个岗，休息时由组内其他人替补 */
+  fixedPostId: string | null
   active: boolean
   note?: string
 }
@@ -12,7 +16,7 @@ export interface Person {
 export interface Post {
   id: string
   name: string
-  /** 该岗位固定需求人数 */
+  /** 该岗位每天固定需求人数 */
   capacity: number
   color: string
 }
@@ -41,11 +45,8 @@ export interface LedgerEntry {
   auto?: boolean
 }
 
-export interface WeekPlan {
-  weekStart: string
-  /** 手动指定的岗位：personId -> postId */
-  manual: Record<string, string>
-}
+/** 单日状态：上班 / 放假（未设置时按周一至周六上班、周日休息） */
+export type DayState = 'work' | 'off'
 
 export interface AppData {
   version: number
@@ -56,7 +57,10 @@ export interface AppData {
   }
   people: Person[]
   posts: Post[]
+  /** 节假日等单日状态覆盖：日期 -> 上班 / 放假 */
+  days: Record<string, DayState>
+  /** 逐日岗位调整：`日期|人员id` -> 岗位id，空字符串表示当天不排 */
+  dayPosts: Record<string, string>
   leaves: LeaveRecord[]
   ledger: LedgerEntry[]
-  weeks: Record<string, WeekPlan>
 }
