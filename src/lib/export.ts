@@ -1,6 +1,7 @@
 import type { AppData } from '../types'
 import { addDays, formatMonthDay, monthDates, parseISO, weekdayLabel } from './date'
-import { isOnLeave, planDay } from './scheduler'
+import { planRange } from './scheduler'
+import type { DayPlan } from './scheduler'
 
 function download(content: string, filename: string, mime: string): void {
   const blob = new Blob([content], { type: mime })
@@ -37,11 +38,14 @@ function dayLabel(date: string): string {
   return `${d.getMonth() + 1}/${d.getDate()} ${weekdayLabel(date)}`
 }
 
-function personDayText(data: AppData, personId: string, date: string): string {
-  const person = data.people.find((p) => p.id === personId)
-  if (!person) return ''
-  if (isOnLeave(data, personId, date)) return '假'
-  const plan = planDay(data, date)
+/** 某人在某天的状态文字（依赖已算好的 plan，避免重复排班） */
+function personDayText(
+  data: AppData,
+  personId: string,
+  date: string,
+  plan: DayPlan,
+): string {
+  if (plan.onLeavePersonIds.includes(personId)) return '假'
   if (!plan.working) return '放'
   const postId = plan.byPerson.get(personId)
   if (!postId) return '休'
@@ -53,7 +57,11 @@ export function exportMonthCsv(data: AppData, month: string): void {
   exportDatesCsv(data, monthDates(month), `排班_${month}.csv`, month)
 }
 
-/** 导出任意日期区间的「人员 × 日期」排班表 */
+/**
+ * 导出任意日期区间的「人员 × 日期」排班表。
+ *
+ * 排班只算一遍（planRange），不再逐格重算 —— 原实现是 O(人数 × 天数) 次 planDay。
+ */
 export function exportDatesCsv(
   data: AppData,
   dates: string[],
@@ -61,6 +69,8 @@ export function exportDatesCsv(
   title?: string,
 ): void {
   const people = data.people.filter((p) => p.active).sort((a, b) => a.order - b.order)
+  const plans = planRange(data, dates)
+
   const header: Array<string | number> = ['序号', '姓名']
   dates.forEach((date) => header.push(dayLabel(date)))
   header.push('上班天数', '休假天数', '休息天数')
@@ -75,7 +85,8 @@ export function exportDatesCsv(
     let leave = 0
     let rest = 0
     dates.forEach((date) => {
-      const text = personDayText(data, person.id, date)
+      const plan = plans.get(date)!
+      const text = personDayText(data, person.id, date, plan)
       if (text === '假') leave++
       else if (text === '休' || text === '放') rest++
       else work++
@@ -88,14 +99,88 @@ export function exportDatesCsv(
   exportCsv(rows, filename)
 }
 
-/** 一周排班文本，方便直接发到群里 */
-export function weekText(data: AppData, weekStart: string): string {
-  const lines = [`【排班】${formatMonthDay(weekStart)} - ${formatMonthDay(addDays(weekStart, 6))}`]
-  const personName = new Map(data.people.map((p) => [p.id, p.name]))
-
+/**
+ * 导出岗位表：1:1 复刻实际表。
+ *
+ * 每周一个块，周一~周六六列；行依次为 值班组长 / 各岗位组；
+ * 块末附「调休」块，列出当天不在岗的人。
+ */
+export function exportPostTableCsv(data: AppData, weekStart: string, filename?: string): void {
+  const dates: string[] = []
   for (let i = 0; i < 7; i++) {
     const date = addDays(weekStart, i)
-    const plan = planDay(data, date)
+    if (parseISO(date).getDay() !== 0) dates.push(date)
+  }
+  const plans = planRange(data, dates)
+  const nameById = new Map(data.people.map((p) => [p.id, p.name]))
+
+  const rows: Array<Array<string | number>> = []
+  rows.push([`${data.settings.orgName} 岗位表　${formatMonthDay(weekStart)} - ${formatMonthDay(addDays(weekStart, 6))}`])
+  rows.push(['', ...dates.map((date) => dayLabel(date))])
+  rows.push(['值班组长', ...dates.map((date) => {
+    const plan = plans.get(date)!
+    if (!plan.working) return ''
+    const leaderId = plan.leaderId
+    return leaderId ? (nameById.get(leaderId) ?? '') : '空缺'
+  })])
+
+  for (const post of data.posts) {
+    const capacity = dates[0] ? postCapacity(data, post.id, dates[0]) : post.capacity
+    for (let slot = 0; slot < capacity; slot++) {
+      rows.push([
+        slot === 0 ? post.name : '',
+        ...dates.map((date) => {
+          const plan = plans.get(date)!
+          if (!plan.working) return ''
+          const ids = plan.byPost.get(post.id) ?? []
+          const personId = ids[slot]
+          if (!personId) return ''
+          const name = nameById.get(personId) ?? ''
+          return plan.leaderId === personId ? `${name}★` : name
+        }),
+      ])
+    }
+  }
+
+  rows.push([
+    '调休',
+    ...dates.map((date) => {
+      const plan = plans.get(date)!
+      if (!plan.working) return ''
+      const names = plan.onLeavePersonIds
+        .map((id) => {
+          const type = plan.leaveTypeByPerson.get(id)
+          return type ? `${nameById.get(id) ?? ''}(${type})` : (nameById.get(id) ?? '')
+        })
+        .concat(
+          plan.resting
+            .filter((id) => !plan.onLeavePersonIds.includes(id))
+            .map((id) => nameById.get(id) ?? ''),
+        )
+      return names.join('、')
+    }),
+  ])
+
+  exportCsv(rows, filename ?? `岗位表_${weekStart}.csv`)
+}
+
+function postCapacity(data: AppData, postId: string, date: string): number {
+  const post = data.posts.find((p) => p.id === postId)
+  if (!post) return 0
+  return parseISO(date).getDay() === 6 ? post.saturdayCapacity : post.capacity
+}
+
+/** 一周排班文本，方便直接发到群里 */
+export function weekText(data: AppData, weekStart: string): string {
+  const dates: string[] = []
+  for (let i = 0; i < 7; i++) dates.push(addDays(weekStart, i))
+  const plans = planRange(data, dates)
+  const personName = new Map(data.people.map((p) => [p.id, p.name]))
+
+  const lines = [`【排班】${formatMonthDay(weekStart)} - ${formatMonthDay(addDays(weekStart, 6))}`]
+
+  for (const date of dates) {
+    const plan = plans.get(date)!
     if (!plan.working) {
       lines.push(`${dayLabel(date)}：放假`)
       continue
@@ -103,31 +188,36 @@ export function weekText(data: AppData, weekStart: string): string {
     const parts = data.posts
       .map((post) => {
         const names = (plan.byPost.get(post.id) ?? [])
-          .map((id) => personName.get(id) ?? '')
+          .map((id) => {
+            const name = personName.get(id) ?? ''
+            return plan.leaderId === id ? `${name}★` : name
+          })
           .filter(Boolean)
         return names.length ? `${post.name} ${names.join('、')}` : ''
       })
       .filter(Boolean)
-    if (plan.leaveIds.length) {
-      parts.push(`休假 ${plan.leaveIds.map((id) => personName.get(id) ?? '').join('、')}`)
+    if (plan.onLeavePersonIds.length) {
+      parts.push(`休假 ${plan.onLeavePersonIds.map((id) => personName.get(id) ?? '').join('、')}`)
     }
     lines.push(`${dayLabel(date)}：${parts.join('；') || '无'}`)
   }
 
-  const weekDates = Array.from({ length: 7 }, (_, i) => addDays(weekStart, i))
   const totals = data.people
     .filter((p) => p.active)
     .map((p) => ({
       name: p.name,
-      work: weekDates.filter((d) => !isOnLeave(data, p.id, d) && planDay(data, d).byPerson.get(p.id))
-        .length,
+      work: dates.filter((d) => plans.get(d)!.byPerson.get(p.id)).length,
     }))
     .filter((t) => t.work > 0)
   if (totals.length) {
     lines.push('——')
     lines.push(`本周上班：${totals.map((t) => `${t.name}${t.work}天`).join('，')}`)
   }
-  lines.push(`岗位：${data.posts.map((p) => `${p.name}${p.capacity}人`).join('、')}`)
+  lines.push(
+    `岗位：${data.posts
+      .map((p) => `${p.name}${p.capacity}人（周六${p.saturdayCapacity}）`)
+      .join('、')}`,
+  )
 
   return lines.join('\n')
 }
