@@ -1,41 +1,60 @@
-import { useEffect, useState } from 'react'
+import { useCallback, useEffect, useState } from 'react'
 import type { AppData } from './types'
 import { loadData, saveData } from './lib/store'
 import { currentMonth, startOfWeek, toISO } from './lib/date'
-import WeekView from './components/WeekView'
-import MonthView from './components/MonthView'
-import PersonMonth from './components/PersonMonth'
+import Console from './components/Console'
+import MonthBoard from './components/MonthBoard'
 import PeopleView from './components/PeopleView'
-import PostsView from './components/PostsView'
-import LeaveView from './components/LeaveView'
-import DataView from './components/DataView'
-import ThemeSwitcher from './components/ThemeSwitcher'
+import LedgerView from './components/LedgerView'
+import ExportView from './components/ExportView'
 
 type Theme = 'warm' | 'ocean' | 'dark'
+type TabId = 'board' | 'month' | 'people' | 'ledger' | 'export'
 
-const TABS = [
-  { id: 'week', label: '周看板' },
-  { id: 'month', label: '月看板' },
-  { id: 'personMonth', label: '人员月历' },
+const TABS: Array<{ id: TabId; label: string }> = [
+  { id: 'board', label: '班表' },
+  { id: 'month', label: '月表' },
   { id: 'people', label: '人员' },
-  { id: 'posts', label: '岗位' },
-  { id: 'leave', label: '休假与台账' },
-  { id: 'data', label: '数据' },
-] as const
+  { id: 'ledger', label: '台账' },
+  { id: 'export', label: '导出' },
+]
 
-type TabId = (typeof TABS)[number]['id']
+const THEMES: Array<{ id: Theme; label: string }> = [
+  { id: 'warm', label: '暖纸' },
+  { id: 'ocean', label: '碧海' },
+  { id: 'dark', label: '暗夜' },
+]
+
+interface Toast {
+  kind: 'ok' | 'err' | 'info'
+  title: string
+  detail?: string
+}
+
+const ICON = {
+  chart: 'M3 3v18h18M19 9l-5 5-4-4-3 3',
+  search: 'M11 19a8 8 0 1 0 0-16 8 8 0 0 0 0 16zM21 21l-4.3-4.3',
+  download: 'M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4M7 10l5 5 5-5M12 15V3',
+}
 
 export default function App() {
   const [data, setData] = useState<AppData>(loadData)
-  const [tab, setTab] = useState<TabId>('week')
+  const [tab, setTab] = useState<TabId>('board')
   const [weekStart, setWeekStart] = useState(() => startOfWeek(toISO(new Date())))
   const [month, setMonth] = useState(currentMonth)
   const [theme, setTheme] = useState<Theme>(
     () => (localStorage.getItem('paiban.theme') as Theme) || 'warm',
   )
+  const [toast, setToast] = useState<Toast | null>(null)
+  const [storageError, setStorageError] = useState(false)
 
   useEffect(() => {
-    saveData(data)
+    try {
+      saveData(data)
+      setStorageError(false)
+    } catch {
+      setStorageError(true)
+    }
   }, [data])
 
   useEffect(() => {
@@ -43,67 +62,148 @@ export default function App() {
     localStorage.setItem('paiban.theme', theme)
   }, [theme])
 
-  const activeCount = data.people.filter((p) => p.active).length
-  const capacity = data.posts.reduce((sum, p) => sum + p.capacity, 0)
+  const notify = useCallback((kind: Toast['kind'], title: string, detail?: string) => {
+    setToast({ kind, title, detail })
+    window.setTimeout(() => setToast((prev) => (prev?.title === title ? null : prev)), 2600)
+  }, [])
+
+  const weekEnd = shiftWeek(weekStart, 1)
 
   return (
-    <div className="app">
-      <header className="app-header">
-        <div className="header-inner">
-          <div className="brand">
-            <div className="brand-mark">排</div>
-            <div>
-              <h1>排班台</h1>
-              <p>{data.settings.orgName} · 轮转排班 · 拖拽换班 · 休假台账</p>
-            </div>
-          </div>
-          <div className="header-right">
-            <div className="header-stats">
-              <span>
-                <b>{activeCount}</b> 在岗
-              </span>
-              <span>
-                <b>{data.posts.length}</b> 岗位
-              </span>
-              <span>
-                <b>{capacity}</b> 岗位需求
-              </span>
-            </div>
-            <ThemeSwitcher theme={theme} onChange={setTheme} />
-          </div>
+    <div>
+      <header className="bar">
+        <div className="brand">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+            <path d={ICON.chart} />
+          </svg>
+          排班台
+          <span className="tag">方案 C · 三栏控制台</span>
         </div>
-        <nav className="tabs">
-          {TABS.map((item) => (
+        <div className="spacer" />
+
+        <label className="search">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+            <circle cx="11" cy="11" r="8" />
+            <path d={ICON.search} />
+          </svg>
+          <input placeholder="搜索姓名 / 岗位" />
+        </label>
+
+        <div className="stepper">
+          <button type="button" onClick={() => setWeekStart(shiftWeek(weekStart, -1))} aria-label="上一周">
+            ‹
+          </button>
+          <span>
+            {weekStart.slice(0, 7)} · {weekStart.slice(8, 10)}—{weekEnd.slice(8, 10)}
+          </span>
+          <button type="button" onClick={() => setWeekStart(shiftWeek(weekStart, 1))} aria-label="下一周">
+            ›
+          </button>
+        </div>
+
+        {TABS.filter((item) => item.id !== 'export').map((item) => (
+          <button
+            key={item.id}
+            type="button"
+            className={`btn${tab === item.id ? ' on' : ''}`}
+            onClick={() => setTab(item.id)}
+          >
+            {item.label}
+          </button>
+        ))}
+
+        <button
+          type="button"
+          className={`btn${tab === 'export' ? ' on' : ' acc'}`}
+          onClick={() => setTab('export')}
+          title="导出岗位表 / 人员月表"
+        >
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+            <path d={ICON.download} />
+          </svg>
+          导出
+        </button>
+
+        <div className="row" style={{ gap: 4 }}>
+          {THEMES.map((item) => (
             <button
               key={item.id}
-              className={tab === item.id ? 'tab active' : 'tab'}
-              onClick={() => setTab(item.id)}
+              type="button"
+              className={`btn sm${theme === item.id ? ' on' : ''}`}
+              onClick={() => setTheme(item.id)}
             >
               {item.label}
             </button>
           ))}
-        </nav>
+        </div>
       </header>
 
-      <main className="container">
-        {tab === 'week' && (
-          <WeekView data={data} weekStart={weekStart} onWeekChange={setWeekStart} setData={setData} />
-        )}
-        {tab === 'month' && (
-          <MonthView data={data} month={month} onMonthChange={setMonth} setData={setData} />
-        )}
-        {tab === 'personMonth' && (
-          <PersonMonth data={data} month={month} onMonthChange={setMonth} />
-        )}
-        {tab === 'people' && <PeopleView data={data} setData={setData} />}
-        {tab === 'posts' && <PostsView data={data} setData={setData} />}
-        {tab === 'leave' && <LeaveView data={data} setData={setData} />}
-        {tab === 'data' && (
-          <DataView data={data} setData={setData} month={month} onMonthChange={setMonth} />
-        )}
-      </main>
+      <p className="hint">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+          <path d="M5 9l-3 3 3 3M9 5l3-3 3 3M15 19l-3 3-3-3M19 9l3 3-3 3M2 12h20M12 2v20" />
+        </svg>
+        拖动<b>班表里的姓名</b>可换岗；从左栏<b>人员树</b>拖人进格子＝安排上班；拖到下方<b>不在岗</b>＝当天休息。带{' '}
+        <b>★</b> 的是值班组长。
+      </p>
 
-      <footer className="app-footer">数据保存在本机浏览器，建议定期在「数据」页导出备份</footer>
+      {storageError && (
+        <p className="hint" style={{ color: 'var(--err)', marginBottom: 12 }}>
+          浏览器本地存储不可用，本次修改<b>无法保存</b>，请到「导出」页导出 JSON 备份。
+        </p>
+      )}
+
+      {tab === 'board' && (
+        <Console
+          data={data}
+          weekStart={weekStart}
+          setData={setData}
+          notify={notify}
+        />
+      )}
+      {tab === 'month' && (
+        <MonthBoard data={data} month={month} onMonthChange={setMonth} setData={setData} />
+      )}
+      {tab === 'people' && <PeopleView data={data} setData={setData} />}
+      {tab === 'ledger' && (
+        <LedgerView data={data} setData={setData} month={month} onMonthChange={setMonth} />
+      )}
+      {tab === 'export' && (
+        <ExportView
+          data={data}
+          setData={setData}
+          month={month}
+          onMonthChange={setMonth}
+          weekStart={weekStart}
+        />
+      )}
+
+      <div className="foot">
+        <span>
+          <b>数据</b>　保存在本机浏览器（paiban.data.v3），建议定期在「导出」页备份。
+        </span>
+        <span>
+          <b>岗位配置</b>　工作日 一号台1 受理2 校对扫描2 照相1 填表1 机动1；周六 一号台2 受理3 校对扫描2 照相1 填表2 机动1。
+        </span>
+        <span>
+          <b>周六人手</b>　主班 9 人 + 支援 2 人（甲乙隔周各一组）；支援组日常在 512 柜台，不进本班表。
+        </span>
+      </div>
+
+      {toast && (
+        <div className={`toast ${toast.kind}`}>
+          <span className="mark">{toast.kind === 'ok' ? '✓' : toast.kind === 'err' ? '!' : 'i'}</span>
+          <span>
+            <b>{toast.title}</b>
+            {toast.detail && <span>{toast.detail}</span>}
+          </span>
+        </div>
+      )}
     </div>
   )
+}
+
+function shiftWeek(weekStart: string, delta: number): string {
+  const [y, m, d] = weekStart.split('-').map(Number)
+  const date = new Date(y, m - 1, d + delta * 7)
+  return toISO(date)
 }
