@@ -1,9 +1,10 @@
 import type { AppData, LeaveRecord, Person, Post } from '../types'
-import { parseISO, weekIndexOf, weekdayLabel } from './date'
+import { diffDays, parseISO, startOfWeek, weekIndexOf, weekdayLabel } from './date'
+import { holidayState } from './holidays'
 
 export interface DayStateInfo {
   working: boolean
-  /** 是否由节假日手动设置覆盖 */
+  /** 是否由节假日或手动设置覆盖 */
   overridden: boolean
 }
 
@@ -15,232 +16,367 @@ export interface DayPlan {
   /** personId -> 当天岗位，null 表示不在岗 */
   byPerson: Map<string, string | null>
   byPost: Map<string, string[]>
-  /** 当天既没排班也没休假的人（轮空 / 只排周六的人） */
+  /** 当天既没排班也没休假的人（轮空 / 支援组工作日不进本班表） */
   resting: string[]
-  /** 当天休假的人 */
-  leaveIds: string[]
+  /** 当天休假的人（personId） */
+  onLeavePersonIds: string[]
+  /** 当天休假的人 -> 休假类型 */
+  leaveTypeByPerson: Map<string, LeaveRecord['type']>
   /** 每个岗位还差几个人 */
   vacant: Map<string, number>
+  /** 当天总位次 */
+  capacity: number
+  /** 当天在岗人数 */
+  onDuty: number
+  /** 当天值班组长（不在岗时为 null） */
+  leaderId: string | null
+  /** 组长位次是否空缺（组长当天不在岗） */
+  leaderVacant: boolean
+  /** 当天是否使用了手工覆盖 */
+  overriddenPlan: boolean
+}
+
+/* ------------------------------------------------------------------ *
+ * 休假索引（避免每次线性扫全表）
+ * ------------------------------------------------------------------ */
+
+const leaveIndexCache = new WeakMap<object, Map<string, LeaveRecord[]>>()
+
+function leaveIndex(data: AppData): Map<string, LeaveRecord[]> {
+  let index = leaveIndexCache.get(data.leaves as unknown as object)
+  if (!index) {
+    index = new Map()
+    for (const leave of data.leaves) {
+      const list = index.get(leave.personId) ?? []
+      list.push(leave)
+      index.set(leave.personId, list)
+    }
+    leaveIndexCache.set(data.leaves as unknown as object, index)
+  }
+  return index
 }
 
 export function isOnLeave(data: AppData, personId: string, date: string): boolean {
-  return data.leaves.some(
-    (l) => l.personId === personId && l.start <= date && l.end >= date,
-  )
+  const list = leaveIndex(data).get(personId)
+  if (!list || list.length === 0) return false
+  for (const leave of list) {
+    if (leave.start <= date && leave.end >= date) return true
+  }
+  return false
 }
 
-function leaveOf(data: AppData, personId: string, date: string): LeaveRecord | undefined {
-  return data.leaves.find((l) => l.personId === personId && l.start <= date && l.end >= date)
+export function leaveOf(data: AppData, personId: string, date: string): LeaveRecord | undefined {
+  const list = leaveIndex(data).get(personId)
+  if (!list) return undefined
+  for (const leave of list) {
+    if (leave.start <= date && leave.end >= date) return leave
+  }
+  return undefined
 }
+
+/** 某人某月的休假记录 */
+export function leavesInMonth(data: AppData, month: string): LeaveRecord[] {
+  return data.leaves.filter((l) => l.start.slice(0, 7) <= month && l.end.slice(0, 7) >= month)
+}
+
+/* ------------------------------------------------------------------ *
+ * 单日状态
+ * ------------------------------------------------------------------ */
 
 export function dayState(data: AppData, date: string): DayStateInfo {
-  const weekday = parseISO(date).getDay()
   const override = data.days[date]
   if (override) return { working: override === 'work', overridden: true }
-  return { working: weekday !== 0, overridden: false }
+  const holiday = holidayState(date)
+  if (holiday) return { working: holiday === 'work', overridden: true }
+  return { working: parseISO(date).getDay() !== 0, overridden: false }
 }
 
-/** 该人员的岗位限制是否允许某岗位 */
-function canTake(person: Person, postId: string, weekday: number): boolean {
-  if (person.saturdayOnly && weekday !== 6) return false
+/** 当天是否按周六编制 */
+function isSaturdayPlan(date: string): boolean {
+  return parseISO(date).getDay() === 6
+}
+
+/** 该岗位当天的编制 */
+export function capacityOf(post: Post, date: string): number {
+  return isSaturdayPlan(date) ? post.saturdayCapacity : post.capacity
+}
+
+/** 该岗位是否允许支援组顶岗 */
+function canTake(person: Person, postId: string, date: string): boolean {
+  if (person.pool === 'support' && !isSaturdayPlan(date)) return false
   if (person.fixedPostId) return person.fixedPostId === postId
   if (person.allowedPostIds) return person.allowedPostIds.includes(postId)
   return true
 }
 
-function expandSlots(posts: Post[]): string[] {
+function expandSlots(posts: Post[], date: string): string[] {
   const slots: string[] = []
   for (const post of posts) {
-    const cap = Math.max(0, Math.floor(post.capacity))
+    const cap = capacityOf(post, date)
     for (let i = 0; i < cap; i++) slots.push(post.id)
   }
   return slots
 }
 
-/** 生成某一天的排班（含手动调整与休假覆盖） */
+/* ------------------------------------------------------------------ *
+ * 排班
+ * ------------------------------------------------------------------ */
+
+/** 生成某一天的排班（含手工覆盖与休假） */
 export function planDay(data: AppData, date: string): DayPlan {
   const weekday = parseISO(date).getDay()
   const state = dayState(data, date)
+  const saturday = isSaturdayPlan(date)
   const active = data.people
     .filter((p) => p.active)
     .sort((a, b) => a.order - b.order)
+  const mains = active.filter((p) => p.pool === 'main')
+  const supports = active.filter((p) => p.pool === 'support')
+
+  const onLeavePersonIds: string[] = []
+  const leaveTypeByPerson = new Map<string, LeaveRecord['type']>()
+  for (const person of active) {
+    const leave = leaveOf(data, person.id, date)
+    if (leave) {
+      onLeavePersonIds.push(person.id)
+      leaveTypeByPerson.set(person.id, leave.type)
+    }
+  }
+  const leaveSet = new Set(onLeavePersonIds)
 
   const byPerson = new Map<string, string | null>()
-  const leaveIds: string[] = []
-  const leaveSet = new Set<string>()
-  for (const person of active) {
-    if (isOnLeave(data, person.id, date)) {
-      leaveIds.push(person.id)
-      leaveSet.add(person.id)
-    }
-  }
-
-  if (!state.working) {
-    for (const person of active) byPerson.set(person.id, null)
-    return buildPlan(data, date, weekday, state, active, byPerson, leaveIds, leaveSet)
-  }
+  for (const person of active) byPerson.set(person.id, null)
 
   const posts = data.posts
-  const slots = expandSlots(posts)
-  const regulars = active.filter((p) => !p.saturdayOnly)
-  const saturdayPeople = active.filter((p) => p.saturdayOnly)
+  const slots = expandSlots(posts, date)
   const weekIndex = Math.floor(weekIndexOf(data.settings.startDate, date))
+  const dayIndex = diffDays(startOfWeek(data.settings.startDate), date)
 
-  const availableRegulars = regulars.filter((p) => !leaveSet.has(p.id))
-
-  // 周六：从周六专属人员里轮 1 人上岗，并让 1 名常规人员轮休
-  let weekendPick: Person | null = null
-  let restPickId: string | null = null
-  if (weekday === 6 && saturdayPeople.length > 0) {
-    const pool = saturdayPeople.filter((p) => !leaveSet.has(p.id))
-    if (pool.length > 0) weekendPick = pool[((weekIndex % pool.length) + pool.length) % pool.length]
-    if (weekendPick && availableRegulars.length > 0) {
-      const rest =
-        availableRegulars[((weekIndex % availableRegulars.length) + availableRegulars.length) % availableRegulars.length]
-      restPickId = rest.id
-    }
-  }
-
-  // 常规人员在岗顺序中的位次，用于每周整体顺移
-  const rank = new Map<string, number>()
-  regulars.forEach((p, i) => rank.set(p.id, i))
-  saturdayPeople.forEach((p, i) => rank.set(p.id, i))
-
-  const assignList: Person[] = []
-  if (weekendPick) assignList.push(weekendPick)
-  // 休假人员也参与占位，最后再移除，避免一个人休假导致整张表大幅错位
-  for (const person of regulars) {
-    if (person.id !== restPickId) assignList.push(person)
-  }
-
-  const slotOwner: Array<number | null> = new Array(slots.length).fill(null)
-  const locked = new Set<number>()
-
-  const lockToPost = (personId: string, postId: string | null): boolean => {
-    const ai = assignList.findIndex((p) => p.id === personId)
-    if (ai < 0) return false
-    const si = slots.findIndex(
-      (slotPost, index) => slotPost === postId && slotOwner[index] === null,
-    )
-    if (si < 0) return false
-    slotOwner[si] = ai
-    locked.add(ai)
-    return true
-  }
-
-  const lockWeekendPick = (): void => {
-    if (!weekendPick) return
-    const allowed = weekendPick.allowedPostIds
-      ? weekendPick.allowedPostIds
-          .map((id) => posts.find((p) => p.id === id))
-          .filter((p): p is Post => !!p && p.capacity > 0)
-      : posts.filter((p) => p.capacity > 0)
-    if (allowed.length === 0) return
-    const preferred = allowed[((weekIndex % allowed.length) + allowed.length) % allowed.length]
-    lockToPost(weekendPick.id, preferred.id)
-  }
-
-  // 周六专属人员优先锁定到「填表 / 一号台」等允许岗位，并按周轮换
-  lockWeekendPick()
-  // 固定岗位人员锁定在本岗
-  for (const person of assignList) {
-    if (person.fixedPostId) lockToPost(person.id, person.fixedPostId)
-  }
-
-  // 其余人员按顺序依次占用剩下的岗位，每周整体顺移一位
-  const freeSlots = slots.map((_, index) => index).filter((index) => slotOwner[index] === null)
-  const flexible = assignList.map((_, index) => index).filter((index) => !locked.has(index))
-  if (freeSlots.length > 0) {
-    flexible.forEach((ai, order) => {
-      const pos =
-        freeSlots[(((order + weekIndex) % freeSlots.length) + freeSlots.length) % freeSlots.length]
-      slotOwner[pos] = ai
+  if (!state.working) {
+    return buildPlan({
+      data,
+      date,
+      weekday,
+      state,
+      active,
+      byPerson,
+      onLeavePersonIds,
+      leaveTypeByPerson,
+      leaveSet,
+      slots,
+      leaderId: null,
+      leaderVacant: false,
+      overriddenPlan: false,
     })
   }
 
-  // 有人被「只能上某些岗」限制时，改用匹配算法兜底
-  const violates = flexible.some((ai) => {
-    const person = assignList[ai]
-    const si = slotOwner.findIndex((owner) => owner === ai)
-    return si < 0 || !canTake(person, slots[si], weekday)
+  // 可用主班（排除请假的）
+  const availableMains = mains.filter((p) => !leaveSet.has(p.id))
+  // 支援组：周六按甲乙隔周选一组，工作日不进本班表
+  const supportCount = saturday ? Math.max(0, data.settings.supportSlots) : 0
+  const crew: 'A' | 'B' = data.settings.crewAlternate ? (weekIndex % 2 === 0 ? 'A' : 'B') : 'A'
+  const availableSupports = supports
+    .filter((p) => !leaveSet.has(p.id))
+    .filter((p) => !p.crew || p.crew === crew)
+    .sort((a, b) => a.order - b.order)
+  const supportPicks = availableSupports.slice(0, supportCount)
+
+  // 固定岗优先锁定
+  const slotOwner = new Array<string | null>(slots.length).fill(null)
+  const lockedPeople = new Set<string>()
+
+  const lockToPost = (personId: string, postId: string): boolean => {
+    const si = slots.findIndex((slotPost, index) => slotPost === postId && slotOwner[index] === null)
+    if (si < 0) return false
+    slotOwner[si] = personId
+    lockedPeople.add(personId)
+    return true
+  }
+
+  for (const person of availableMains) {
+    if (person.fixedPostId) lockToPost(person.id, person.fixedPostId)
+  }
+  for (const person of supportPicks) {
+    if (person.fixedPostId) lockToPost(person.id, person.fixedPostId)
+  }
+
+  // 支援组占用靠后的位次（辅助性岗位），按组内顺序轮换
+  const supportSlotIndexes: number[] = []
+  if (supportPicks.length > 0) {
+    for (let i = slots.length - 1; i >= 0 && supportSlotIndexes.length < supportPicks.length; i--) {
+      if (slotOwner[i] === null) supportSlotIndexes.push(i)
+    }
+    supportSlotIndexes.sort((a, b) => a - b)
+    supportPicks.forEach((person, i) => {
+      const si = supportSlotIndexes[i]
+      if (si !== undefined) {
+        slotOwner[si] = person.id
+        lockedPeople.add(person.id)
+      }
+    })
+  }
+
+  // 其余人员按相位轮转填满剩余位次；相位随日期推进（每天顺移一位，每周额外顺移一位）
+  const pool = availableMains.filter((p) => !lockedPeople.has(p.id))
+  const freeSlots: number[] = []
+  slots.forEach((_, index) => {
+    if (slotOwner[index] === null) freeSlots.push(index)
+  })
+  if (pool.length > 0 && freeSlots.length > 0) {
+    const phase = ((dayIndex + weekIndex) % pool.length + pool.length) % pool.length
+    const count = Math.min(pool.length, freeSlots.length)
+    // 先挑出当天轮休的人：间隔取，避免出现连休三天再连上四天
+    const restCount = pool.length - count
+    const step = restCount > 0 ? Math.max(1, Math.floor(pool.length / restCount)) : 1
+    const resting = new Set<string>()
+    for (let k = 0; k < restCount; k++) {
+      resting.add(pool[(phase + k * step) % pool.length].id)
+    }
+    // 其余的人整体顺移补位：第 i 位次由顺移后第 i 个人补
+    let slot = 0
+    for (let i = 0; i < pool.length && slot < count; i++) {
+      const person = pool[(phase + i) % pool.length]
+      if (resting.has(person.id)) continue
+      slotOwner[freeSlots[slot]] = person.id
+      slot++
+    }
+  }
+
+  // 岗位受限的人可能落到不允许的岗位，改用匹配算法兜底
+  // 注意：没排上的人属于正常轮休，不算违规
+  const violates = pool.some((person) => {
+    const si = slotOwner.findIndex((owner) => owner === person.id)
+    if (si < 0) return false
+    return !canTake(person, slots[si], date)
   })
 
   if (violates) {
     slotOwner.fill(null)
-    locked.clear()
-    lockWeekendPick()
-    for (const person of assignList) {
+    lockedPeople.clear()
+
+    for (const person of availableMains) {
       if (person.fixedPostId) lockToPost(person.id, person.fixedPostId)
     }
+    for (const person of supportPicks) {
+      if (person.fixedPostId) lockToPost(person.id, person.fixedPostId)
+    }
+    if (supportPicks.length > 0) {
+      const indexes: number[] = []
+      for (let i = slots.length - 1; i >= 0 && indexes.length < supportPicks.length; i--) {
+        if (slotOwner[i] === null) indexes.push(i)
+      }
+      indexes.sort((a, b) => a - b)
+      supportPicks.forEach((person, i) => {
+        const si = indexes[i]
+        if (si !== undefined) {
+          slotOwner[si] = person.id
+          lockedPeople.add(person.id)
+        }
+      })
+    }
 
-    const cycle = slots.length || 1
-    const candidates: number[][] = assignList.map((person) => {
-      const base = rank.get(person.id) ?? 0
-      const preferredSlot = (((base + weekIndex) % cycle) + cycle) % cycle
+    const rest = availableMains.filter((p) => !lockedPeople.has(p.id))
+    const candidates: number[][] = rest.map((person) => {
       const list: number[] = []
-      for (let d = 0; d < slots.length; d++) {
-        const si = (preferredSlot + d) % slots.length
-        if (slotOwner[si] !== null && locked.has(slotOwner[si]!)) continue
-        if (canTake(person, slots[si], weekday)) list.push(si)
+      for (let si = 0; si < slots.length; si++) {
+        if (slotOwner[si] !== null && lockedPeople.has(slotOwner[si]!)) continue
+        if (canTake(person, slots[si], date)) list.push(si)
       }
       return list
     })
 
-    const tryAssign = (ai: number, visited: boolean[]): boolean => {
-      for (const si of candidates[ai]) {
+    const tryAssign = (ri: number, visited: boolean[]): boolean => {
+      for (const si of candidates[ri]) {
         if (visited[si]) continue
         visited[si] = true
         const owner = slotOwner[si]
         if (owner === null) {
-          slotOwner[si] = ai
+          slotOwner[si] = rest[ri].id
           return true
         }
-        if (!locked.has(owner) && tryAssign(owner, visited)) {
-          slotOwner[si] = ai
-          return true
+        if (!lockedPeople.has(owner)) {
+          const ownerIndex = rest.findIndex((p) => p.id === owner)
+          if (ownerIndex >= 0 && tryAssign(ownerIndex, visited)) {
+            slotOwner[si] = rest[ri].id
+            return true
+          }
         }
       }
       return false
     }
 
-    assignList.forEach((_, ai) => {
-      if (locked.has(ai)) return
-      tryAssign(ai, new Array(slots.length).fill(false))
+    rest.forEach((_, ri) => {
+      if (lockedPeople.has(rest[ri].id)) return
+      tryAssign(ri, new Array(slots.length).fill(false))
     })
   }
 
-  for (const person of active) byPerson.set(person.id, null)
   slots.forEach((postId, si) => {
-    const ai = slotOwner[si]
-    if (ai !== null) byPerson.set(assignList[ai].id, postId)
+    const owner = slotOwner[si]
+    if (owner) byPerson.set(owner, postId)
   })
 
-  // 手动调整只影响当天
-  const prefix = `${date}|`
-  for (const [key, postId] of Object.entries(data.dayPosts)) {
-    if (!key.startsWith(prefix)) continue
-    const personId = key.slice(prefix.length)
-    if (!byPerson.has(personId)) continue
-    if (postId === '') byPerson.set(personId, null)
-    else if (posts.some((p) => p.id === postId)) byPerson.set(personId, postId)
+  // 手工覆盖：整日替换该日的岗位安排（槽位为 null 表示该位次空缺）
+  const override = data.dayPlans[date]
+  let overriddenPlan = false
+  if (override) {
+    overriddenPlan = true
+    for (const person of active) byPerson.set(person.id, null)
+    const assigned = new Set<string>()
+    for (const post of posts) {
+      const slots = override[post.id] ?? []
+      for (const personId of slots) {
+        if (!personId || assigned.has(personId)) continue
+        const person = active.find((p) => p.id === personId)
+        if (!person || leaveSet.has(personId)) continue
+        assigned.add(personId)
+        byPerson.set(personId, post.id)
+      }
+    }
   }
 
   // 休假优先级最高
   for (const personId of leaveSet) byPerson.set(personId, null)
 
-  return buildPlan(data, date, weekday, state, active, byPerson, leaveIds, leaveSet)
+  const leaderId = resolveLeader(data, date, byPerson)
+  const leaderVacant = leaderId === null
+
+  return buildPlan({
+    data,
+    date,
+    weekday,
+    state,
+    active,
+    byPerson,
+    onLeavePersonIds,
+    leaveTypeByPerson,
+    leaveSet,
+    slots,
+    leaderId,
+    leaderVacant,
+    overriddenPlan,
+  })
 }
 
-function buildPlan(
-  data: AppData,
-  date: string,
-  weekday: number,
-  state: DayStateInfo,
-  active: Person[],
-  byPerson: Map<string, string | null>,
-  leaveIds: string[],
-  leaveSet: Set<string>,
-): DayPlan {
+interface BuildArgs {
+  data: AppData
+  date: string
+  weekday: number
+  state: DayStateInfo
+  active: Person[]
+  byPerson: Map<string, string | null>
+  onLeavePersonIds: string[]
+  leaveTypeByPerson: Map<string, LeaveRecord['type']>
+  leaveSet: Set<string>
+  slots: string[]
+  leaderId: string | null
+  leaderVacant: boolean
+  overriddenPlan: boolean
+}
+
+function buildPlan(args: BuildArgs): DayPlan {
+  const { data, date, weekday, state, active, byPerson, leaveSet, slots } = args
+
   const byPost = new Map<string, string[]>()
   for (const post of data.posts) byPost.set(post.id, [])
   for (const person of active) {
@@ -251,12 +387,17 @@ function buildPlan(
   const vacant = new Map<string, number>()
   for (const post of data.posts) {
     const count = byPost.get(post.id)!.length
-    vacant.set(post.id, state.working ? Math.max(0, post.capacity - count) : 0)
+    vacant.set(post.id, state.working ? Math.max(0, capacityOf(post, date) - count) : 0)
   }
 
   const resting = active
     .filter((p) => !byPerson.get(p.id) && !leaveSet.has(p.id))
     .map((p) => p.id)
+
+  let onDuty = 0
+  for (const person of active) {
+    if (byPerson.get(person.id)) onDuty++
+  }
 
   return {
     date,
@@ -266,10 +407,65 @@ function buildPlan(
     byPerson,
     byPost,
     resting,
-    leaveIds,
+    onLeavePersonIds: args.onLeavePersonIds,
+    leaveTypeByPerson: args.leaveTypeByPerson,
     vacant,
+    capacity: state.working ? slots.length : 0,
+    onDuty,
+    leaderId: args.leaderId,
+    leaderVacant: args.leaderVacant,
+    overriddenPlan: args.overriddenPlan,
   }
 }
+
+/* ------------------------------------------------------------------ *
+ * 值班组长
+ * ------------------------------------------------------------------ */
+
+/** 组长池：可以担任值班组长的人 */
+export function leaderPool(data: AppData): Person[] {
+  return data.people
+    .filter((p) => p.active && p.canLead)
+    .sort((a, b) => a.order - b.order)
+}
+
+/**
+ * 当天值班组长：
+ * 1. 优先取手工指定（dayLeaders）
+ * 2. 否则按组长池轮值（相位每天推进），跳过当天不在岗的人，顺延到下一位在岗组长
+ * 3. 若当天没有任何在岗组长则返回 null（触发「组长位次空缺」告警）
+ */
+export function resolveLeader(
+  data: AppData,
+  date: string,
+  byPerson: Map<string, string | null>,
+): string | null {
+  const pool = leaderPool(data)
+  if (pool.length === 0) return null
+
+  const manual = data.dayLeaders[date]
+  if (manual && byPerson.has(manual)) return byPerson.get(manual) ? manual : null
+
+  const phase = leaderPhase(data, date)
+  for (let i = 0; i < pool.length; i++) {
+    const candidate = pool[(phase + i) % pool.length]
+    if (byPerson.get(candidate.id)) return candidate.id
+  }
+  return null
+}
+
+/** 组长轮值相位 */
+function leaderPhase(data: AppData, date: string): number {
+  const pool = leaderPool(data)
+  if (pool.length === 0) return 0
+  const dayIndex = diffDays(startOfWeek(data.settings.startDate), date)
+  const weekIndex = Math.floor(weekIndexOf(data.settings.startDate, date))
+  return (((dayIndex + weekIndex) % pool.length) + pool.length) % pool.length
+}
+
+/* ------------------------------------------------------------------ *
+ * 校验
+ * ------------------------------------------------------------------ */
 
 export interface CheckResult {
   ok: boolean
@@ -310,10 +506,10 @@ export function checkPersonPost(
   const post = data.posts.find((p) => p.id === postId)
   if (!post) return fail('岗位不存在', '规则：只能排到已设置的岗位。')
 
-  if (person.saturdayOnly && parseISO(date).getDay() !== 6) {
+  if (person.pool === 'support' && !isSaturdayPlan(date)) {
     return fail(
-      `${person.name} 只排周六，不能排到${weekdayLabel(date)}`,
-      '规则：周六专属人员只在周六上班。',
+      `${person.name} 是支援组，平时在 512 柜台，不进本班表`,
+      '规则：支援组只在周六顶岗。',
     )
   }
 
@@ -355,10 +551,7 @@ export function checkSwap(data: AppData, date: string, aId: string, bId: string)
 
   const leaveB = leaveOf(data, bId, date)
   if (leaveB) {
-    return fail(
-      `${b.name} 当天${leaveB.type}，不能对调`,
-      '规则：休假期间不排班。',
-    )
+    return fail(`${b.name} 当天${leaveB.type}，不能对调`, '规则：休假期间不排班。')
   }
   if (!postA) {
     return fail(`${a.name} 当天不在岗，无法对调`, '规则：只有当天在岗的两人才能对调。')
@@ -386,14 +579,18 @@ export function checkMove(data: AppData, date: string, personId: string, postId:
   const post = data.posts.find((p) => p.id === postId)
   if (!post) return fail('岗位不存在', '')
   const occupants = (plan.byPost.get(postId) ?? []).filter((id) => id !== personId)
-  if (occupants.length >= post.capacity) {
+  if (occupants.length >= capacityOf(post, date)) {
     return fail(
-      `「${post.name}」已满（需 ${post.capacity} 人），请直接拖到在岗人员身上对调`,
+      `「${post.name}」已满（需 ${capacityOf(post, date)} 人），请直接拖到在岗人员身上对调`,
       '规则：岗位人数不能超编。',
     )
   }
   return OK
 }
+
+/* ------------------------------------------------------------------ *
+ * 统计
+ * ------------------------------------------------------------------ */
 
 /** 某人在某月的上班天数 */
 export function countWorkDays(data: AppData, personId: string, dates: string[]): number {
@@ -404,9 +601,111 @@ export function countWorkDays(data: AppData, personId: string, dates: string[]):
   }, 0)
 }
 
+/** 某人在某月的休息天数：周日公休 + 表内不在岗登记（含年假） */
+export function countRestDays(data: AppData, personId: string, dates: string[]): number {
+  let rest = 0
+  for (const date of dates) {
+    const plan = planDay(data, date)
+    if (!plan.working) {
+      rest++
+      continue
+    }
+    if (!plan.byPerson.get(personId)) rest++
+  }
+  return rest
+}
+
+/** 某人在某月的周六值班次数（支援组不计调休额度） */
+export function countDutySaturdays(data: AppData, personId: string, dates: string[]): number {
+  const person = data.people.find((p) => p.id === personId)
+  if (!person || person.pool !== 'main') return 0
+  let count = 0
+  for (const date of dates) {
+    if (!isSaturdayPlan(date)) continue
+    if (isOnLeave(data, personId, date)) continue
+    const plan = planDay(data, date)
+    if (plan.byPerson.get(personId)) count++
+  }
+  return count
+}
+
 /** 生成一段时间内每一天的排班 */
 export function planRange(data: AppData, dates: string[]): Map<string, DayPlan> {
   const map = new Map<string, DayPlan>()
   for (const date of dates) map.set(date, planDay(data, date))
   return map
+}
+
+/* ------------------------------------------------------------------ *
+ * 告警
+ * ------------------------------------------------------------------ */
+
+export type AlertLevel = 'error' | 'warn' | 'info'
+
+export interface ShiftAlert {
+  level: AlertLevel
+  title: string
+  detail: string
+  date?: string
+}
+
+export interface AlertSummary {
+  alerts: ShiftAlert[]
+  errors: number
+  warnings: number
+}
+
+/** 生成一段时间内的告警 */
+export function buildAlerts(data: AppData, dates: string[]): AlertSummary {
+  const alerts: ShiftAlert[] = []
+  const min = data.settings.minDailyHeadcount
+  let errors = 0
+  let warnings = 0
+
+  for (const date of dates) {
+    const plan = planDay(data, date)
+    if (!plan.working) continue
+
+    if (plan.onDuty < min) {
+      errors++
+      alerts.push({
+        level: 'error',
+        date,
+        title: `${shortDate(date)} ${weekdayLabel(date)} 在岗 ${plan.onDuty} 人`,
+        detail: `低于每日最少在岗 ${min} 人，缺 ${min - plan.onDuty} 人`,
+      })
+    }
+
+    if (plan.leaderVacant) {
+      warnings++
+      const leaderName = manualOrPickedLeaderName(data, date)
+      alerts.push({
+        level: 'warn',
+        date,
+        title: `${shortDate(date)} ${weekdayLabel(date)} 组长位次空缺`,
+        detail: leaderName
+          ? `值班组长${leaderName}当天不在岗，无人顶班`
+          : '当天没有在岗的组长，需指定代理组长',
+      })
+    }
+  }
+
+  return { alerts, errors, warnings }
+}
+
+/** 当天应到的组长名字（即便当天不在岗） */
+export function manualOrPickedLeaderName(data: AppData, date: string): string | null {
+  const manual = data.dayLeaders[date]
+  if (manual) {
+    const person = data.people.find((p) => p.id === manual)
+    return person?.name ?? null
+  }
+  const pool = leaderPool(data)
+  if (pool.length === 0) return null
+  return pool[leaderPhase(data, date)].name
+}
+
+function shortDate(date: string): string {
+  const d = parseISO(date)
+  return `${d.getMonth() + 1}/${d.getDate()}`
 }
