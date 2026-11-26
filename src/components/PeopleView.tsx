@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from 'react'
 import type { Dispatch, SetStateAction } from 'react'
-import type { AppData, CrewId, Person, Pool } from '../types'
+import type { AppData, LeaderScope, Person, Pool, Team, TeamId } from '../types'
 import { POST_COLORS, uid } from '../lib/store'
 
 interface Props {
@@ -19,6 +19,18 @@ interface ToastState {
   kind: 'ok' | 'err' | 'info'
   title: string
   text?: string
+}
+
+const TEAM_IDS: TeamId[] = ['A', 'B']
+
+function teamName(id: TeamId): string {
+  return id === 'A' ? 'A组' : 'B组'
+}
+
+/** 保证班组数组里存在该组（数据被外部改动过时不至于报错） */
+function upsertTeam(teams: Team[], teamId: TeamId): Team[] {
+  if (teams.some((t) => t.id === teamId)) return teams
+  return [...teams, { id: teamId, name: teamName(teamId), memberIds: [] }]
 }
 
 function PeopleIcon() {
@@ -68,6 +80,36 @@ function TeamsIcon() {
     >
       <circle cx="12" cy="7" r="3" />
       <path d="M6 21v-1a6 6 0 0 1 12 0v1" />
+    </svg>
+  )
+}
+
+function LeadIcon() {
+  return (
+    <svg
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth={2}
+      strokeLinecap="round"
+      strokeLinejoin="round"
+    >
+      <path d="M12 3l2.5 6.3H21l-5.2 4 2 6.4L12 16l-5.8 3.7 2-6.4L3 9.3h6.5z" />
+    </svg>
+  )
+}
+
+function SettingsIcon() {
+  return (
+    <svg
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth={2}
+      strokeLinecap="round"
+      strokeLinejoin="round"
+    >
+      <path d="M4 21v-7M4 10V3M12 21v-9M12 8V3M20 21v-5M20 12V3M1 14h6M9 8h6M17 16h6" />
     </svg>
   )
 }
@@ -153,10 +195,13 @@ export default function PeopleView({ data, setData }: Props) {
 
   const [newName, setNewName] = useState('')
   const [newPool, setNewPool] = useState<Pool>('main')
-  const [newCrew, setNewCrew] = useState<CrewId>('A')
+  const [newTeam, setNewTeam] = useState<TeamId | 'none'>('none')
   const [newPostName, setNewPostName] = useState('')
   const [newPostCapacity, setNewPostCapacity] = useState('1')
   const [newPostSaturday, setNewPostSaturday] = useState('1')
+  const [teamPick, setTeamPick] = useState<Record<TeamId, string>>({ A: '', B: '' })
+  const [hallPick, setHallPick] = useState('')
+  const [counterPick, setCounterPick] = useState('')
 
   useEffect(() => {
     if (!toast) return
@@ -166,17 +211,170 @@ export default function PeopleView({ data, setData }: Props) {
 
   const people = useMemo(() => [...data.people].sort((a, b) => a.order - b.order), [data.people])
   const mainPeople = useMemo(() => people.filter((p) => p.pool === 'main'), [people])
-  const supportPeople = useMemo(() => people.filter((p) => p.pool === 'support'), [people])
-  const leaderPool = useMemo(() => people.filter((p) => p.canLead && p.active), [people])
+  const counterPeople = useMemo(() => people.filter((p) => p.pool === 'counter'), [people])
+  const hallLeaders = useMemo(
+    () =>
+      people
+        .filter((p) => p.canLead && p.leaderScope !== 'counter' && p.active)
+        .sort((a, b) => (a.leaderOrder ?? a.order) - (b.leaderOrder ?? b.order)),
+    [people],
+  )
+  const counterLeaders = useMemo(
+    () =>
+      people
+        .filter((p) => p.canLead && p.leaderScope === 'counter' && p.active)
+        .sort((a, b) => (a.leaderOrder ?? a.order) - (b.leaderOrder ?? b.order)),
+    [people],
+  )
 
-  const weekdayCapacity = data.posts.reduce((sum, p) => sum + p.capacity, 0)
-  const saturdayCapacity = data.posts.reduce((sum, p) => sum + p.saturdayCapacity, 0)
+  const teamOptions = useMemo(
+    () =>
+      TEAM_IDS.map((id) => ({
+        id,
+        name: data.teams.find((t) => t.id === id)?.name ?? teamName(id),
+      })),
+    [data.teams],
+  )
+
+  const teamMembersMap = useMemo(() => {
+    const map = new Map<TeamId, Person[]>()
+    for (const id of TEAM_IDS) {
+      const team = data.teams.find((t) => t.id === id)
+      const members = (team?.memberIds ?? [])
+        .map((pid) => data.people.find((p) => p.id === pid))
+        .filter((p): p is Person => !!p)
+      map.set(id, members)
+    }
+    return map
+  }, [data.teams, data.people])
+
+  const weekdayCapacity = data.posts.reduce((sum, p) => sum + (p.separate ? 0 : p.capacity), 0)
+  const saturdayCapacity = data.posts.reduce((sum, p) => sum + (p.separate ? 0 : p.saturdayCapacity), 0)
+  const counterCapacity = data.posts.reduce((sum, p) => sum + (p.separate ? p.capacity : 0), 0)
+
+  const fixedAssignments = data.posts
+    .map((post) => ({
+      post,
+      members: people.filter((p) => p.active && p.fixedPostId === post.id),
+    }))
+    .filter((row) => row.members.length > 0)
 
   function updatePerson(id: string, patch: Partial<Person>) {
     setData((prev) => ({
       ...prev,
       people: prev.people.map((p) => (p.id === id ? { ...p, ...patch } : p)),
     }))
+  }
+
+  /** 设置组长职务：null = 不是组长 */
+  function setLeaderScope(id: string, scope: LeaderScope | null) {
+    setData((prev) => {
+      const sameScope = prev.people.filter(
+        (p) => p.active && p.canLead && p.leaderScope === scope && p.id !== id,
+      )
+      const maxOrder = sameScope.reduce((max, p) => Math.max(max, p.leaderOrder ?? p.order), 0)
+      return {
+        ...prev,
+        people: prev.people.map((p) =>
+          p.id === id
+            ? {
+                ...p,
+                canLead: scope !== null,
+                leaderScope: scope ?? undefined,
+                leaderOrder: scope === null ? undefined : maxOrder + 1,
+              }
+            : p,
+        ),
+      }
+    })
+  }
+
+  /** 把某人放进某组：组内顺序 = 追加到末尾；同时清掉别组的记录 */
+  function addTeamMember(teamId: TeamId, personId: string) {
+    if (!personId) return
+    setData((prev) => ({
+      ...prev,
+      teams: upsertTeam(prev.teams, teamId).map((t) =>
+        t.id === teamId
+          ? {
+              ...t,
+              memberIds: t.memberIds.includes(personId) ? t.memberIds : [...t.memberIds, personId],
+            }
+          : { ...t, memberIds: t.memberIds.filter((mid) => mid !== personId) },
+      ),
+      people: prev.people.map((p) => (p.id === personId ? { ...p, teamId } : p)),
+    }))
+    const person = data.people.find((p) => p.id === personId)
+    setToast({ kind: 'ok', title: '已加入班组', text: person ? `${person.name} → ${teamName(teamId)}` : undefined })
+  }
+
+  function removeTeamMember(teamId: TeamId, personId: string) {
+    setData((prev) => ({
+      ...prev,
+      teams: prev.teams.map((t) =>
+        t.id === teamId ? { ...t, memberIds: t.memberIds.filter((mid) => mid !== personId) } : t,
+      ),
+      people: prev.people.map((p) =>
+        p.id === personId ? { ...p, teamId: p.teamId === teamId ? null : p.teamId } : p,
+      ),
+    }))
+  }
+
+  function moveTeamMember(teamId: TeamId, personId: string, delta: number) {
+    setData((prev) => ({
+      ...prev,
+      teams: prev.teams.map((t) => {
+        if (t.id !== teamId) return t
+        const ids = [...t.memberIds]
+        const index = ids.indexOf(personId)
+        const target = index + delta
+        if (index < 0 || target < 0 || target >= ids.length) return t
+        const tmp = ids[index]
+        ids[index] = ids[target]
+        ids[target] = tmp
+        return { ...t, memberIds: ids }
+      }),
+    }))
+  }
+
+  /** 人员表里直接改班组 */
+  function setPersonTeam(personId: string, teamId: TeamId | null) {
+    setData((prev) => ({
+      ...prev,
+      teams: (teamId ? upsertTeam(prev.teams, teamId) : prev.teams).map((t) =>
+        t.id === teamId
+          ? {
+              ...t,
+              memberIds: t.memberIds.includes(personId) ? t.memberIds : [...t.memberIds, personId],
+            }
+          : { ...t, memberIds: t.memberIds.filter((mid) => mid !== personId) },
+      ),
+      people: prev.people.map((p) => (p.id === personId ? { ...p, teamId } : p)),
+    }))
+  }
+
+  /** 大厅组长轮值顺序 = leaderOrder（王玉花 → 杨娟 → 汪甜），与名单 order 无关 */
+  function moveHallLeader(personId: string, delta: number) {
+    setData((prev) => {
+      const leaders = prev.people
+        .filter((p) => p.canLead && p.leaderScope !== 'counter' && p.active)
+        .sort((a, b) => (a.leaderOrder ?? a.order) - (b.leaderOrder ?? b.order))
+      const index = leaders.findIndex((p) => p.id === personId)
+      const target = index + delta
+      if (index < 0 || target < 0 || target >= leaders.length) return prev
+      const next = [...leaders]
+      const [moved] = next.splice(index, 1)
+      next.splice(target, 0, moved)
+      const slots = leaders.map((p) => p.leaderOrder ?? p.order).sort((a, b) => a - b)
+      const orderMap = new Map(next.map((p, i) => [p.id, slots[i]]))
+      return {
+        ...prev,
+        people: prev.people.map((p) => {
+          const leaderOrder = orderMap.get(p.id)
+          return leaderOrder === undefined ? p : { ...p, leaderOrder }
+        }),
+      }
+    })
   }
 
   function addPerson() {
@@ -186,18 +384,27 @@ export default function PeopleView({ data, setData }: Props) {
       return
     }
     const maxOrder = people.reduce((max, p) => Math.max(max, p.order), 0)
+    const teamId = newTeam === 'none' ? null : newTeam
     const person: Person = {
       id: uid('person'),
       name: trimmed,
       order: maxOrder + 1,
       pool: newPool,
-      crew: newPool === 'support' ? newCrew : null,
+      teamId,
       canLead: false,
       allowedPostIds: null,
       fixedPostId: null,
       active: true,
     }
-    setData((prev) => ({ ...prev, people: [...prev.people, person] }))
+    setData((prev) => ({
+      ...prev,
+      people: [...prev.people, person],
+      teams: teamId
+        ? upsertTeam(prev.teams, teamId).map((t) =>
+            t.id === teamId ? { ...t, memberIds: [...t.memberIds, person.id] } : t,
+          )
+        : prev.teams,
+    }))
     setNewName('')
     setToast({ kind: 'ok', title: '已添加', text: trimmed })
   }
@@ -226,7 +433,7 @@ export default function PeopleView({ data, setData }: Props) {
     if (!person) return
     setConfirm({
       title: '删除人员',
-      body: `确定删除「${person.name}」？该员的休假记录、台账和手工排班会一起删除。`,
+      body: `确定删除「${person.name}」？该员的休假记录、台账和手工排班会一起删除，班组名单也会移除。`,
       confirmText: '删除',
       onConfirm: () => {
         setData((prev) => {
@@ -250,6 +457,10 @@ export default function PeopleView({ data, setData }: Props) {
           return {
             ...prev,
             people: prev.people.filter((p) => p.id !== id),
+            teams: prev.teams.map((t) => ({
+              ...t,
+              memberIds: t.memberIds.filter((mid) => mid !== id),
+            })),
             leaves: prev.leaves.filter((l) => l.personId !== id),
             ledger: prev.ledger.filter((e) => e.personId !== id),
             dayPlans,
@@ -373,35 +584,39 @@ export default function PeopleView({ data, setData }: Props) {
           />
         </td>
         <td>
-          {person.pool === 'support' ? (
-            <select
-              className="input"
-              value={person.crew ?? 'A'}
-              onChange={(e) => updatePerson(person.id, { crew: e.target.value as CrewId })}
-            >
-              {data.crews.map((crew) => (
-                <option key={crew.id} value={crew.id}>
-                  {crew.name}
-                </option>
-              ))}
-            </select>
-          ) : (
-            <span className="chip">主班</span>
-          )}
+          <select
+            className="input"
+            value={person.teamId ?? ''}
+            title="值班班组：决定周六及法定假日值班"
+            onChange={(e) => setPersonTeam(person.id, e.target.value === '' ? null : (e.target.value as TeamId))}
+          >
+            <option value="">不分组</option>
+            {teamOptions.map((team) => (
+              <option key={team.id} value={team.id}>
+                {team.name}
+              </option>
+            ))}
+          </select>
         </td>
         <td>
-          <button
-            className={`btn sm${person.canLead ? ' on' : ''}`}
-            onClick={() => updatePerson(person.id, { canLead: !person.canLead })}
-            title="组长是职务标签，可担任值班组长"
+          <select
+            className="input"
+            value={person.canLead ? (person.leaderScope === 'counter' ? 'counter' : 'hall') : ''}
+            title="组长范围：大厅组长管除 512 外所有岗位，512 组长只管柜台"
+            onChange={(e) =>
+              setLeaderScope(person.id, e.target.value === '' ? null : (e.target.value as LeaderScope))
+            }
           >
-            组长
-          </button>
+            <option value="">非组长</option>
+            <option value="hall">大厅组长</option>
+            <option value="counter">512 组长</option>
+          </select>
         </td>
         <td>
           <select
             className="input"
             value={person.fixedPostId ?? ''}
+            title="固定岗：除本岗外不可调岗；照相岗缺人时全员可顶"
             onChange={(e) => updatePerson(person.id, { fixedPostId: e.target.value || null })}
           >
             <option value="">不固定</option>
@@ -436,7 +651,7 @@ export default function PeopleView({ data, setData }: Props) {
           <PeopleIcon />
           人员
           <span className="rt">
-            主班 {mainPeople.length} · 支援 {supportPeople.length} · 组长 {leaderPool.length}
+            主班 {mainPeople.length} · 512 柜台 {counterPeople.length} · 组长 {hallLeaders.length + counterLeaders.length}
           </span>
         </h2>
         <div className="panel-body">
@@ -459,22 +674,21 @@ export default function PeopleView({ data, setData }: Props) {
               onChange={(e) => setNewPool(e.target.value as Pool)}
             >
               <option value="main">主班池</option>
-              <option value="support">周末支援组</option>
+              <option value="counter">512 柜台</option>
             </select>
-            {newPool === 'support' ? (
-              <select
-                className="input"
-                value={newCrew}
-                style={{ width: 110 }}
-                onChange={(e) => setNewCrew(e.target.value as CrewId)}
-              >
-                {data.crews.map((crew) => (
-                  <option key={crew.id} value={crew.id}>
-                    {crew.name}
-                  </option>
-                ))}
-              </select>
-            ) : null}
+            <select
+              className="input"
+              value={newTeam}
+              style={{ width: 110 }}
+              onChange={(e) => setNewTeam(e.target.value as TeamId | 'none')}
+            >
+              <option value="none">不分组</option>
+              {teamOptions.map((team) => (
+                <option key={team.id} value={team.id}>
+                  {team.name}
+                </option>
+              ))}
+            </select>
             <button className="btn acc" onClick={addPerson}>
               <PlusIcon />
               添加人员
@@ -484,7 +698,7 @@ export default function PeopleView({ data, setData }: Props) {
           <div className="grp-hd">
             <i />
             主班池
-            <span className="cnt">{mainPeople.length} 人</span>
+            <span className="cnt">{mainPeople.length} 人 · 工作日轮转岗位</span>
           </div>
           {mainPeople.length === 0 ? (
             <div className="empty">主班池还没有人。</div>
@@ -494,8 +708,8 @@ export default function PeopleView({ data, setData }: Props) {
                 <tr>
                   <th style={{ width: 116 }}>顺序</th>
                   <th style={{ width: 130 }}>姓名</th>
-                  <th style={{ width: 100 }}>分组</th>
-                  <th style={{ width: 92 }}>组长</th>
+                  <th style={{ width: 100 }}>值班班组</th>
+                  <th style={{ width: 118 }}>组长范围</th>
                   <th style={{ width: 140 }}>固定岗位</th>
                   <th style={{ width: 92 }}>状态</th>
                   <th style={{ width: 60 }}>操作</th>
@@ -507,48 +721,317 @@ export default function PeopleView({ data, setData }: Props) {
 
           <div className="grp-hd">
             <i />
-            周末支援组
-            <span className="cnt">{supportPeople.length} 人 · 只在周六顶岗</span>
+            512 柜台
+            <span className="cnt">{counterPeople.length} 人 · 工作日常驻 512，周六随值班组进大厅</span>
           </div>
-          {supportPeople.length === 0 ? (
-            <div className="empty">还没有支援组成员。</div>
+          {counterPeople.length === 0 ? (
+            <div className="empty">512 柜台还没有人。</div>
           ) : (
             <table className="tbl">
               <thead>
                 <tr>
                   <th style={{ width: 116 }}>顺序</th>
                   <th style={{ width: 130 }}>姓名</th>
-                  <th style={{ width: 100 }}>分组</th>
-                  <th style={{ width: 92 }}>组长</th>
+                  <th style={{ width: 100 }}>值班班组</th>
+                  <th style={{ width: 118 }}>组长范围</th>
                   <th style={{ width: 140 }}>固定岗位</th>
                   <th style={{ width: 92 }}>状态</th>
                   <th style={{ width: 60 }}>操作</th>
                 </tr>
               </thead>
-              <tbody>{renderPeopleRows(supportPeople, 'support')}</tbody>
+              <tbody>{renderPeopleRows(counterPeople, 'counter')}</tbody>
             </table>
           )}
 
-          <div className="grp-hd">
-            <i />
-            组长池
-            <span className="cnt">{leaderPool.length} 人 · 按天轮值</span>
-          </div>
-          <div className="row" style={{ marginTop: 4 }}>
-            {leaderPool.length === 0 ? (
-              <span className="note" style={{ marginTop: 0 }}>
-                还没有组长，值班组长会显示空缺。
-              </span>
-            ) : (
-              leaderPool.map((person) => (
-                <span key={person.id} className="chip lead">
-                  {person.name}
-                </span>
-              ))
-            )}
-          </div>
           <p className="note">
-            组长是职务标签，不是独立岗位：组长当天通常兼一个具体位次。固定岗位只排那一个岗，休息时由组内其他人替补。
+            512 柜台是独立岗位：工作日常驻 512，不与大厅岗位混排，也不计入大厅在岗人数；周六及法定调休上班日不设 512 岗，
+            柜台人员随值班组进大厅。
+          </p>
+        </div>
+      </div>
+
+      <div className="panel" style={{ marginBottom: 14 }}>
+        <h2>
+          <TeamsIcon />
+          值班班组
+          <span className="rt">A / B 隔周交替 · 组内顺序即轮转与借人顺序</span>
+        </h2>
+        <div className="panel-body">
+          <div className="grid2">
+            {teamOptions.map((team) => {
+              const members = teamMembersMap.get(team.id) ?? []
+              const candidates = people.filter((p) => !members.some((m) => m.id === p.id))
+              const picked = teamPick[team.id]
+              return (
+                <div key={team.id}>
+                  <div className="grp-hd">
+                    <i />
+                    {team.name}
+                    <span className="cnt">{members.length} 人</span>
+                  </div>
+                  {members.length === 0 ? (
+                    <div className="empty">暂无成员。</div>
+                  ) : (
+                    <table className="tbl">
+                      <thead>
+                        <tr>
+                          <th style={{ width: 44 }}>序</th>
+                          <th>姓名</th>
+                          <th style={{ width: 120 }}>操作</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {members.map((person, index) => (
+                          <tr key={person.id}>
+                            <td className="num">{index + 1}</td>
+                            <td>
+                              <div className="row" style={{ gap: 6 }}>
+                                <span>{person.name}</span>
+                                {person.fixedPostId ? (
+                                  <span className="chip">
+                                    固定{data.posts.find((p) => p.id === person.fixedPostId)?.name ?? ''}
+                                  </span>
+                                ) : null}
+                                {person.canLead ? <span className="chip lead">组长</span> : null}
+                              </div>
+                            </td>
+                            <td>
+                              <div className="row" style={{ gap: 4, flexWrap: 'nowrap' }}>
+                                <button
+                                  className="btn sm ghost"
+                                  title="上移"
+                                  disabled={index === 0}
+                                  onClick={() => moveTeamMember(team.id, person.id, -1)}
+                                >
+                                  <UpIcon />
+                                </button>
+                                <button
+                                  className="btn sm ghost"
+                                  title="下移"
+                                  disabled={index === members.length - 1}
+                                  onClick={() => moveTeamMember(team.id, person.id, 1)}
+                                >
+                                  <DownIcon />
+                                </button>
+                                <button
+                                  className="btn sm ghost"
+                                  title="移出该组"
+                                  onClick={() => removeTeamMember(team.id, person.id)}
+                                >
+                                  <TrashIcon />
+                                </button>
+                              </div>
+                            </td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  )}
+                  <div className="row" style={{ marginTop: 8 }}>
+                    <select
+                      className="input"
+                      value={picked}
+                      style={{ width: 150 }}
+                      onChange={(e) => {
+                        const value = e.target.value
+                        setTeamPick((prev) => (team.id === 'A' ? { ...prev, A: value } : { ...prev, B: value }))
+                      }}
+                    >
+                      <option value="">选择人员…</option>
+                      {candidates.map((p) => (
+                        <option key={p.id} value={p.id}>
+                          {p.name}
+                        </option>
+                      ))}
+                    </select>
+                    <button
+                      className="btn sm"
+                      disabled={!picked}
+                      onClick={() => {
+                        addTeamMember(team.id, picked)
+                        setTeamPick((prev) => (team.id === 'A' ? { ...prev, A: '' } : { ...prev, B: '' }))
+                      }}
+                    >
+                      <PlusIcon />
+                      加入
+                    </button>
+                  </div>
+                </div>
+              )
+            })}
+          </div>
+
+          <p className="note">
+            A、B 两组隔周交替承担周六及法定假日值班，值班时整组上岗。组内顺序决定轮转先后，也是 B 组缺人时的借人顺序：
+            B 组比 A 组少 1 人，按 A 组名单顺序一人一次轮借、循环使用。调整顺序请用上下移动按钮。
+          </p>
+        </div>
+      </div>
+
+      <div className="panel" style={{ marginBottom: 14 }}>
+        <h2>
+          <LeadIcon />
+          组长设置
+          <span className="rt">
+            大厅组长 {hallLeaders.length} 人 · 512 柜台组长 {counterLeaders.length} 人
+          </span>
+        </h2>
+        <div className="panel-body">
+          <div className="grid2">
+            <div>
+              <div className="grp-hd">
+                <i />
+                大厅组长
+                <span className="cnt">{hallLeaders.length} 人 · 按下列顺序逐日轮值</span>
+              </div>
+              {hallLeaders.length === 0 ? (
+                <div className="empty">还没有大厅组长。</div>
+              ) : (
+                <table className="tbl">
+                  <thead>
+                    <tr>
+                      <th style={{ width: 44 }}>序</th>
+                      <th>姓名</th>
+                      <th style={{ width: 120 }}>操作</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {hallLeaders.map((person, index) => (
+                      <tr key={person.id}>
+                        <td className="num">{index + 1}</td>
+                        <td>{person.name}</td>
+                        <td>
+                          <div className="row" style={{ gap: 4, flexWrap: 'nowrap' }}>
+                            <button
+                              className="btn sm ghost"
+                              title="上移（轮值提前）"
+                              disabled={index === 0}
+                              onClick={() => moveHallLeader(person.id, -1)}
+                            >
+                              <UpIcon />
+                            </button>
+                            <button
+                              className="btn sm ghost"
+                              title="下移（轮值推后）"
+                              disabled={index === hallLeaders.length - 1}
+                              onClick={() => moveHallLeader(person.id, 1)}
+                            >
+                              <DownIcon />
+                            </button>
+                            <button
+                              className="btn sm ghost"
+                              title="取消组长"
+                              onClick={() => setLeaderScope(person.id, null)}
+                            >
+                              <TrashIcon />
+                            </button>
+                          </div>
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              )}
+              <div className="row" style={{ marginTop: 8 }}>
+                <select
+                  className="input"
+                  value={hallPick}
+                  style={{ width: 150 }}
+                  onChange={(e) => setHallPick(e.target.value)}
+                >
+                  <option value="">选择人员…</option>
+                  {people
+                    .filter((p) => p.active && !(p.canLead && p.leaderScope !== 'counter'))
+                    .map((p) => (
+                      <option key={p.id} value={p.id}>
+                        {p.name}
+                      </option>
+                    ))}
+                </select>
+                <button
+                  className="btn sm"
+                  disabled={!hallPick}
+                  onClick={() => {
+                    setLeaderScope(hallPick, 'hall')
+                    setHallPick('')
+                  }}
+                >
+                  <PlusIcon />
+                  设为大厅组长
+                </button>
+              </div>
+            </div>
+
+            <div>
+              <div className="grp-hd">
+                <i />
+                512 柜台组长
+                <span className="cnt">{counterLeaders.length} 人 · 只负责 512</span>
+              </div>
+              {counterLeaders.length === 0 ? (
+                <div className="empty">还没有 512 柜台组长。</div>
+              ) : (
+                <table className="tbl">
+                  <thead>
+                    <tr>
+                      <th style={{ width: 44 }}>序</th>
+                      <th>姓名</th>
+                      <th style={{ width: 120 }}>操作</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {counterLeaders.map((person, index) => (
+                      <tr key={person.id}>
+                        <td className="num">{index + 1}</td>
+                        <td>{person.name}</td>
+                        <td>
+                          <button
+                            className="btn sm ghost"
+                            title="取消组长"
+                            onClick={() => setLeaderScope(person.id, null)}
+                          >
+                            <TrashIcon />
+                          </button>
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              )}
+              <div className="row" style={{ marginTop: 8 }}>
+                <select
+                  className="input"
+                  value={counterPick}
+                  style={{ width: 150 }}
+                  onChange={(e) => setCounterPick(e.target.value)}
+                >
+                  <option value="">选择人员…</option>
+                  {people
+                    .filter((p) => p.active && !(p.canLead && p.leaderScope === 'counter'))
+                    .map((p) => (
+                      <option key={p.id} value={p.id}>
+                        {p.name}
+                      </option>
+                    ))}
+                </select>
+                <button
+                  className="btn sm"
+                  disabled={!counterPick}
+                  onClick={() => {
+                    setLeaderScope(counterPick, 'counter')
+                    setCounterPick('')
+                  }}
+                >
+                  <PlusIcon />
+                  设为 512 组长
+                </button>
+              </div>
+            </div>
+          </div>
+
+          <p className="note">
+            大厅组长管辖除 512 以外的所有岗位，按上表顺序逐日轮值；512 柜台组长只负责 512 柜台。组长是职务标签，不是独立岗位：
+            组长当天通常兼一个具体位次。
           </p>
         </div>
       </div>
@@ -558,7 +1041,7 @@ export default function PeopleView({ data, setData }: Props) {
           <PostsIcon />
           岗位
           <span className="rt">
-            {data.posts.length} 个岗位组 · 工作日 {weekdayCapacity} 位次 · 周六 {saturdayCapacity} 位次
+            {data.posts.length} 个岗位 · 大厅工作日 {weekdayCapacity} 位次 · 周六 {saturdayCapacity} 位次
           </span>
         </h2>
         <div className="panel-body">
@@ -612,6 +1095,7 @@ export default function PeopleView({ data, setData }: Props) {
                   <th style={{ width: 120 }}>工作日编制</th>
                   <th style={{ width: 120 }}>周六编制</th>
                   <th style={{ width: 90 }}>颜色</th>
+                  <th style={{ width: 150 }}>类型</th>
                   <th style={{ width: 60 }}>操作</th>
                 </tr>
               </thead>
@@ -661,6 +1145,16 @@ export default function PeopleView({ data, setData }: Props) {
                       />
                     </td>
                     <td>
+                      <div className="row" style={{ gap: 4 }}>
+                        {post.separate ? (
+                          <span className="chip support">独立岗</span>
+                        ) : (
+                          <span className="chip">大厅岗</span>
+                        )}
+                        {post.flexMode ? <span className="chip">浮动岗</span> : null}
+                      </div>
+                    </td>
+                    <td>
                       <button className="btn sm ghost" title="删除" onClick={() => removePost(post.id)}>
                         <TrashIcon />
                       </button>
@@ -670,72 +1164,120 @@ export default function PeopleView({ data, setData }: Props) {
               </tbody>
             </table>
           )}
-          <p className="note">工作日编制合计 {weekdayCapacity} 位次，周六编制合计 {saturdayCapacity} 位次。</p>
+          <p className="note">
+            大厅岗位工作日编制合计 {weekdayCapacity} 位次，周六（含法定调休上班日）编制合计 {saturdayCapacity} 位次；
+            512 柜台编制 {counterCapacity} 人。独立岗（512）单独成块，不计入大厅在岗人数，周六与法定调休上班日不设 512 岗。
+          </p>
+
+          <div className="grp-hd">
+            <i />
+            固定岗
+            <span className="cnt">{fixedAssignments.reduce((n, row) => n + row.members.length, 0)} 人</span>
+          </div>
+          {fixedAssignments.length === 0 ? (
+            <div className="empty">还没有固定岗人员，可在人员表「固定岗位」列设置。</div>
+          ) : (
+            <table className="tbl">
+              <thead>
+                <tr>
+                  <th style={{ width: 160 }}>岗位</th>
+                  <th>人员</th>
+                </tr>
+              </thead>
+              <tbody>
+                {fixedAssignments.map((row) => (
+                  <tr key={row.post.id}>
+                    <td>{row.post.name}</td>
+                    <td>
+                      <div className="row" style={{ gap: 6 }}>
+                        {row.members.map((person) => (
+                          <span key={person.id} className="chip">
+                            {person.name}
+                          </span>
+                        ))}
+                      </div>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          )}
+          <p className="note">
+            固定岗的人只上本岗，除本岗外不可调岗，休息时由机动岗顶上；照相岗缺人时（固定岗人员不在）全员可顶，任何人都能被拖去顶替照相岗。
+          </p>
         </div>
       </div>
 
       <div className="panel">
         <h2>
-          <TeamsIcon />
-          小组
-          <span className="rt">支援组甲乙 · 隔周轮换</span>
+          <SettingsIcon />
+          小组设置
+          <span className="rt">周六值班隔周交替 · 改完立即生效</span>
         </h2>
         <div className="panel-body">
           <div className="grid2">
-            {data.crews.map((crew) => {
-              const members = supportPeople.filter((p) => p.crew === crew.id)
-              return (
-                <div key={crew.id}>
-                  <div className="grp-hd">
-                    <i />
-                    {crew.name}
-                    <span className="cnt">{members.length} 人</span>
-                  </div>
-                  <div className="row" style={{ marginTop: 4 }}>
-                    {members.length === 0 ? (
-                      <span className="note" style={{ marginTop: 0 }}>
-                        暂无成员。
-                      </span>
-                    ) : (
-                      members.map((person) => (
-                        <span key={person.id} className="chip support">
-                          {person.name}
-                        </span>
-                      ))
-                    )}
-                  </div>
-                </div>
-              )
-            })}
-          </div>
-
-          <div className="grid2" style={{ marginTop: 14 }}>
-            <div className="field" style={{ marginBottom: 0 }}>
-              <label>甲乙隔周轮换</label>
-              <button
-                className={`btn sm${data.settings.crewAlternate ? ' on' : ''}`}
-                style={{ width: 92 }}
-                onClick={() => setSetting('crewAlternate', !data.settings.crewAlternate)}
+            <div className="field">
+              <label>第一个周六值班组</label>
+              <select
+                className="input"
+                value={data.settings.firstTeam}
+                onChange={(e) => setSetting('firstTeam', e.target.value as AppData['settings']['firstTeam'])}
               >
-                {data.settings.crewAlternate ? '开' : '关'}
-              </button>
+                <option value="A">A 组</option>
+                <option value="B">B 组</option>
+              </select>
             </div>
-            <div className="field" style={{ marginBottom: 0 }}>
-              <label>周六支援位（人）</label>
+            <div className="field">
+              <label>班组名称</label>
+              <input
+                className="input"
+                type="text"
+                value={data.settings.orgName}
+                onChange={(e) => setSetting('orgName', e.target.value)}
+              />
+            </div>
+            <div className="field">
+              <label>轮转起始周（周一）</label>
+              <input
+                className="input"
+                type="date"
+                value={data.settings.startDate}
+                onChange={(e) => setSetting('startDate', e.target.value)}
+              />
+            </div>
+            <div className="field">
+              <label>每人每月休息目标（天）</label>
               <input
                 className="input"
                 type="number"
                 min={0}
-                value={data.settings.supportSlots}
-                style={{ width: 92 }}
-                onChange={(e) => setSetting('supportSlots', Math.max(0, toInt(e.target.value, data.settings.supportSlots)))}
+                value={data.settings.restQuotaDays}
+                onChange={(e) =>
+                  setSetting('restQuotaDays', Math.max(0, toInt(e.target.value, data.settings.restQuotaDays)))
+                }
+              />
+            </div>
+            <div className="field">
+              <label>每日最少在岗人数（不含 512）</label>
+              <input
+                className="input"
+                type="number"
+                min={0}
+                value={data.settings.minDailyHeadcount}
+                onChange={(e) =>
+                  setSetting('minDailyHeadcount', Math.max(0, toInt(e.target.value, data.settings.minDailyHeadcount)))
+                }
               />
             </div>
           </div>
 
           <p className="note">
-            开启后支援组按周在甲、乙之间轮换：轮转起始周为 {data.settings.startDate} 起的第一周排甲组，第二周排乙组。
-            支援组日常在 512 柜台，不进本班表。
+            周六及法定假日由 A、B 两组隔周交替整组上岗：从轮转起始周 {data.settings.startDate} 起的第一个周六排第一个值班组，
+            此后逐周交替。最少在岗人数不含 512 柜台，休息目标只用于月表提示。
+          </p>
+          <p className="note">
+            轮休额度：周六值班 1 天 +1，法定假日加班 1 天 +1，登记调休或补休 1 天 −1。额度当月用完，月末未使用清零，不结转下月；
+            轮休日期在「台账」页手动登记。
           </p>
         </div>
       </div>

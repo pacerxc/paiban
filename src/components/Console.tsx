@@ -2,7 +2,7 @@ import { useMemo, useRef, useState } from 'react'
 import type { Dispatch, SetStateAction, DragEvent } from 'react'
 import type { AppData } from '../types'
 import { addDays, parseISO, weekdayLabel } from '../lib/date'
-import { buildAlerts, capacityOf, planDay, planRange } from '../lib/scheduler'
+import { buildAlerts, planDay, planRange } from '../lib/scheduler'
 import type { DayPlan } from '../lib/scheduler'
 import { buildLedger } from '../lib/leave'
 
@@ -83,13 +83,16 @@ export default function Console({ data, weekStart, setData, notify }: Props) {
   const dragRef = useRef<DragState | null>(null)
   const [overKey, setOverKey] = useState<string | null>(null)
 
+  const hallPosts = data.posts.filter((p) => !p.separate)
+  const counterPosts = data.posts.filter((p) => p.separate)
+
   /* ------------------------------------------------------------ 槽位 */
 
   /** 取得某天某岗位的槽位（null = 空位次） */
   function slotsOf(date: string, postId: string, plan: DayPlan): Slots {
     const post = postById.get(postId)
     if (!post) return []
-    const cap = capacityOf(post, date)
+    const cap = plan.slotCount.get(postId) ?? 0
     const override = data.dayPlans[date]
     const base: Slots = override
       ? (override[postId] ?? []).slice(0, cap)
@@ -160,7 +163,13 @@ export default function Console({ data, weekStart, setData, notify }: Props) {
   }
 
   /** 把人放到某天的某个位次；返回被挤出的那个人 */
-  function placeInto(day: DaySlots, date: string, postId: string, slot: number | null, personId: string): string | null {
+  function placeInto(
+    day: DaySlots,
+    date: string,
+    postId: string,
+    slot: number | null,
+    personId: string,
+  ): string | null {
     const arr = day[postId]
     if (!arr) return null
 
@@ -196,7 +205,12 @@ export default function Console({ data, weekStart, setData, notify }: Props) {
 
   function dropToCell(date: string, postId: string, slot: number | null, drag: DragState) {
     const source = drag.source
-    if (source.type === 'cell' && source.date === date && source.postId === postId && source.slot === slot) {
+    if (
+      source.type === 'cell' &&
+      source.date === date &&
+      source.postId === postId &&
+      source.slot === slot
+    ) {
       return
     }
 
@@ -232,11 +246,12 @@ export default function Console({ data, weekStart, setData, notify }: Props) {
         const srcArr = srcDay[source.postId]
         if (srcArr) {
           const empty = srcArr.findIndex((x) => x === null)
-          const at = source.slot >= 0 && source.slot < srcArr.length && srcArr[source.slot] === null
-            ? source.slot
-            : empty >= 0
-              ? empty
-              : 0
+          const at =
+            source.slot >= 0 && source.slot < srcArr.length && srcArr[source.slot] === null
+              ? source.slot
+              : empty >= 0
+                ? empty
+                : 0
           srcArr[at] = displaced
         }
         if (source.date !== date) dayPlans[source.date] = srcDay
@@ -247,7 +262,11 @@ export default function Console({ data, weekStart, setData, notify }: Props) {
         `${personById.get(displaced)?.name ?? ''} 换到「${postById.get(postId)?.name ?? ''}」的来源位次`,
       )
     } else {
-      notify('ok', `${personById.get(drag.personId)?.name ?? ''} 已安排到「${postById.get(postId)?.name ?? ''}」`, shortDate(date))
+      notify(
+        'ok',
+        `${personById.get(drag.personId)?.name ?? ''} 已安排到「${postById.get(postId)?.name ?? ''}」`,
+        shortDate(date),
+      )
     }
 
     dayPlans[date] = day
@@ -264,7 +283,11 @@ export default function Console({ data, weekStart, setData, notify }: Props) {
     }
     dayPlans[date] = day
     setData({ ...data, dayPlans })
-    notify('info', `${personById.get(drag.personId)?.name ?? ''} ${shortDate(date)} 改为休息`, '拖回岗位格可恢复上班')
+    notify(
+      'info',
+      `${personById.get(drag.personId)?.name ?? ''} ${shortDate(date)} 改为休息`,
+      '拖回岗位格可恢复上班',
+    )
   }
 
   /* ------------------------------------------------------- 顶部操作 */
@@ -283,17 +306,10 @@ export default function Console({ data, weekStart, setData, notify }: Props) {
     notify('info', '本周调整已清除', '恢复为自动排班')
   }
 
-  function resetDay(date: string) {
-    const dayPlans = { ...data.dayPlans }
-    delete dayPlans[date]
-    setData({ ...data, dayPlans })
-    notify('info', `${shortDate(date)} 已恢复自动排班`)
-  }
-
   /* ---------------------------------------------------------- 渲染 */
 
   const mains = data.people.filter((p) => p.active && p.pool === 'main')
-  const supports = data.people.filter((p) => p.active && p.pool === 'support')
+  const counters = data.people.filter((p) => p.active && p.pool === 'counter')
   const leaders = data.people.filter((p) => p.active && p.canLead)
 
   const alerts = useMemo(() => buildAlerts(data, dates), [data, dates])
@@ -322,23 +338,122 @@ export default function Console({ data, weekStart, setData, notify }: Props) {
       else item.used += Math.abs(Math.min(0, row.days))
       map.set(row.personId, item)
     }
-    return mains
+    return data.people
+      .filter((p) => p.active)
       .map((p) => {
         const item = map.get(p.id) ?? { duty: 0, used: 0 }
-        return { name: p.name, duty: item.duty, used: item.used, balance: item.duty - item.used }
+        return {
+          name: p.name,
+          duty: item.duty,
+          used: item.used,
+          balance: item.duty - item.used,
+        }
       })
       .sort((a, b) => b.balance - a.balance)
-  }, [data, mains, monthDates])
+  }, [data, monthDates])
 
   const debtCount = ledgerRows.filter((r) => r.balance < 0).length
   const shortRestCount = restStat.filter((r) => r.value < data.settings.restQuotaDays).length
   const hasDebt = debtCount > 0 || shortRestCount > 0
 
-  const weekTotal = data.posts.reduce((sum, p) => sum + p.capacity, 0)
-  const satTotal = data.posts.reduce((sum, p) => sum + p.saturdayCapacity, 0)
+  const weekTotal = hallPosts.reduce((sum, p) => sum + p.capacity, 0)
+  const satTotal = hallPosts.reduce((sum, p) => sum + p.saturdayCapacity, 0)
+  const counterTotal = counterPosts.reduce((sum, p) => sum + p.capacity, 0)
 
   const leaderPlans = dates.map((date) => plans.get(date)!)
   const vacantLeaders = leaderPlans.filter((p) => p.working && p.leaderVacant)
+  const counterLeaderName = counters.find((p) => p.canLead)?.name ?? ''
+
+  /** 渲染一行岗位 */
+  function renderPostRow(post: (typeof data.posts)[number], isCounter = false) {
+    return (
+      <tr key={post.id} className={isCounter ? 'row-counter' : undefined}>
+        <td className={`posthd${isCounter ? ' sep' : ''}`}>
+          <div className="g">
+            <i />
+            {post.name}
+          </div>
+          <div className="c">
+            {isCounter
+              ? `${post.capacity}人 · 周六无此岗`
+              : `${post.capacity}人 · 周六${post.saturdayCapacity}`}
+          </div>
+        </td>
+        {dates.map((date) => {
+          const plan = plans.get(date)!
+          if (!plan.working) {
+            return (
+              <td key={date} className="cell col-off">
+                公休
+              </td>
+            )
+          }
+          const slots = slotsOf(date, post.id, plan)
+          const low = !isCounter && plan.onDuty < data.settings.minDailyHeadcount
+          const cls = [
+            plan.type === 'duty' ? 'col-sat' : '',
+            low ? 'col-low' : '',
+            overKey === `cell:${date}:${post.id}` ? 'over' : '',
+          ]
+            .filter(Boolean)
+            .join(' ')
+          return (
+            <td
+              key={date}
+              className={`cell ${cls}`}
+              data-drop="cell"
+              data-date={date}
+              data-post={post.id}
+              onDragOver={onDragOver}
+              onDrop={onDrop}
+            >
+              {slots.map((personId, index) => {
+                if (!personId) {
+                  return (
+                    <span key={index} className="pc vac" data-slot={index}>
+                      缺
+                    </span>
+                  )
+                }
+                const person = personById.get(personId)
+                if (!person) return null
+                const isLeader =
+                  plan.leaderId === personId || plan.counterLeaderId === personId
+                const note = [
+                  person.fixedPostId ? `固定${postById.get(person.fixedPostId)?.name ?? ''}` : '',
+                  person.teamId ? `${person.teamId}组` : '',
+                  person.pool === 'counter' ? '512 柜台' : '',
+                ]
+                  .filter(Boolean)
+                  .join(' · ')
+                return (
+                  <span
+                    key={index}
+                    className="pc"
+                    draggable
+                    data-slot={index}
+                    title={note || undefined}
+                    onDragStart={(e) =>
+                      onDragStart(e, personId, {
+                        type: 'cell',
+                        date,
+                        postId: post.id,
+                        slot: index,
+                      })
+                    }
+                    onDragEnd={onDragEnd}
+                  >
+                    {person.name}
+                    {isLeader && <span className="st">★</span>}
+                  </span>
+                )
+              })}
+            </td>
+          )
+        })}
+      </tr>
+    )
+  }
 
   return (
     <div className="console">
@@ -372,25 +487,49 @@ export default function Console({ data, weekStart, setData, notify }: Props) {
               {p.fixedPostId && (
                 <span className="b rest">{postById.get(p.fixedPostId)?.name ?? '固定'}</span>
               )}
+              {p.teamId && <span className="b">{p.teamId}组</span>}
             </span>
           </div>
         ))}
 
         <div className="grp-hd">
           <i style={{ background: '#9aa1aa' }} />
-          周末支援组
-          <span className="cnt">{supports.length} 人</span>
+          512 柜台
+          <span className="cnt">{counters.length} 人</span>
         </div>
-        {supports.map((p) => (
+        {counters.map((p) => (
           <div
             key={p.id}
             className="team"
             draggable
+            data-person={p.id}
             onDragStart={(e) => onDragStart(e, p.id, { type: 'tree' })}
             onDragEnd={onDragEnd}
           >
-            <span className="g">{p.crew ?? '—'}</span>
+            <span className="g">{p.teamId ?? '—'}</span>
             <span className="ns">{p.name}</span>
+            {p.canLead && (
+              <span className="tags">
+                <span className="b lead">组长</span>
+              </span>
+            )}
+          </div>
+        ))}
+
+        <div className="grp-hd" style={{ paddingTop: 14 }}>
+          <i style={{ background: 'var(--slate)' }} />
+          值班班组
+          <span className="cnt">周六隔周轮</span>
+        </div>
+        {data.teams.map((team) => (
+          <div key={team.id} className="team">
+            <span className="g">{team.id}</span>
+            <span className="ns">
+              {team.memberIds
+                .map((id) => personById.get(id)?.name ?? '')
+                .filter(Boolean)
+                .join('、')}
+            </span>
           </div>
         ))}
 
@@ -408,13 +547,16 @@ export default function Console({ data, weekStart, setData, notify }: Props) {
             onDragEnd={onDragEnd}
           >
             <span className="ns">{p.name}</span>
+            <span className="tags">
+              <span className="b lead">{p.leaderScope === 'counter' ? '512' : '大厅'}</span>
+            </span>
           </div>
         ))}
 
         <div className="pad" style={{ paddingTop: 13 }}>
           <div className="note" style={{ marginTop: 0 }}>
-            组长是职务标签，不是独立岗位；组长当天通常兼一个具体位次。
-            支援组日常在 512 柜台，不进本班表，只在周六顶岗。
+            组长是职务标签，不是独立岗位。大厅组长按 王玉花 → 杨娟 → 汪甜 逐日轮值；
+            艾丽娜只负责 512 柜台。
           </div>
         </div>
       </aside>
@@ -422,9 +564,19 @@ export default function Console({ data, weekStart, setData, notify }: Props) {
       {/* ------------------------------------------------ 中栏：班表 */}
       <main className="center">
         <div className="center-hd">
-          <h1>本班表 · 第 {Math.max(1, Math.round((parseISO(weekStart).getTime() - parseISO(data.settings.startDate).getTime()) / (7 * 86400000)) + 1)} 周</h1>
+          <h1>
+            本班表 · 第{' '}
+            {Math.max(
+              1,
+              Math.round(
+                (parseISO(weekStart).getTime() - parseISO(data.settings.startDate).getTime()) /
+                  (7 * 86400000),
+              ) + 1,
+            )}{' '}
+            周
+          </h1>
           <span className="sub">
-            工作日 {weekTotal} 位次 · 周六 {satTotal} 位次 · 周日公休 · 最少在岗{' '}
+            工作日 {weekTotal} 位次 · 周六 {satTotal} 位次 · 512 柜台 {counterTotal} 人 · 周日公休 · 最少在岗{' '}
             {data.settings.minDailyHeadcount} 人
           </span>
           <div className="rt">
@@ -448,7 +600,10 @@ export default function Console({ data, weekStart, setData, notify }: Props) {
               {leaderPlans
                 .filter((p) => p.working)
                 .map((p) => (
-                  <span key={p.date} style={{ display: 'inline-flex', alignItems: 'center', gap: 3 }}>
+                  <span
+                    key={p.date}
+                    style={{ display: 'inline-flex', alignItems: 'center', gap: 3 }}
+                  >
                     <span style={{ color: 'var(--ink-3)' }}>{weekdayLabel(p.date)}</span>
                     {p.leaderId ? (
                       <>
@@ -465,7 +620,7 @@ export default function Console({ data, weekStart, setData, notify }: Props) {
               )}
             </span>
           )}
-          <span className="rt">组长池按天轮值，可手动改</span>
+          <span className="rt">512 柜台组长 {counterLeaderName || '空缺'}</span>
         </div>
 
         <table className="grid">
@@ -475,7 +630,7 @@ export default function Console({ data, weekStart, setData, notify }: Props) {
               {dates.map((date) => {
                 const plan = plans.get(date)!
                 const low = plan.working && plan.onDuty < data.settings.minDailyHeadcount
-                const cls = !plan.working ? 'off' : parseISO(date).getDay() === 6 ? 'sat' : ''
+                const cls = !plan.working ? 'off' : plan.type === 'duty' ? 'sat' : ''
                 return (
                   <th key={date} className={`${cls}${low ? ' low' : ''}`}>
                     <span className="dow">{weekdayLabel(date)}</span>
@@ -488,91 +643,19 @@ export default function Console({ data, weekStart, setData, notify }: Props) {
               })}
             </tr>
           </thead>
-          <tbody>
-            {data.posts.map((post) => (
-              <tr key={post.id}>
-                <td className="posthd">
-                  <div className="g">
-                    <i />
-                    {post.name}
-                  </div>
-                  <div className="c">
-                    {post.capacity}人 · 周六{post.saturdayCapacity}
-                  </div>
-                </td>
-                {dates.map((date) => {
-                  const plan = plans.get(date)!
-                  if (!plan.working) {
-                    return (
-                      <td key={date} className="cell col-off">
-                        公休
-                      </td>
-                    )
-                  }
-                  const slots = slotsOf(date, post.id, plan)
-                  const low = plan.onDuty < data.settings.minDailyHeadcount
-                  const cls = [
-                    parseISO(date).getDay() === 6 ? 'col-sat' : '',
-                    low ? 'col-low' : '',
-                    overKey === `cell:${date}:${post.id}` ? 'over' : '',
-                  ]
-                    .filter(Boolean)
-                    .join(' ')
-                  return (
-                    <td
-                      key={date}
-                      className={`cell ${cls}`}
-                      data-drop="cell"
-                      data-date={date}
-                      data-post={post.id}
-                      onDragOver={onDragOver}
-                      onDrop={onDrop}
-                    >
-                      {slots.map((personId, index) => {
-                        if (!personId) {
-                          return (
-                            <span key={index} className="pc vac" data-slot={index}>
-                              缺
-                            </span>
-                          )
-                        }
-                        const person = personById.get(personId)
-                        if (!person) return null
-                        const isLeader = plan.leaderId === personId
-                        const note = [
-                          person.fixedPostId ? `固定${postById.get(person.fixedPostId)?.name ?? ''}` : '',
-                          person.pool === 'support' ? '支援组' : '',
-                        ]
-                          .filter(Boolean)
-                          .join(' · ')
-                        return (
-                          <span
-                            key={index}
-                            className="pc"
-                            draggable
-                            data-slot={index}
-                            title={note || undefined}
-                            onDragStart={(e) =>
-                              onDragStart(e, personId, {
-                                type: 'cell',
-                                date,
-                                postId: post.id,
-                                slot: index,
-                              })
-                            }
-                            onDragEnd={onDragEnd}
-                          >
-                            {person.name}
-                            {isLeader && <span className="st">★</span>}
-                          </span>
-                        )
-                      })}
-                    </td>
-                  )
-                })}
-              </tr>
-            ))}
-          </tbody>
+          <tbody>{hallPosts.map((post) => renderPostRow(post))}</tbody>
+          {counterPosts.length > 0 && (
+            <>
+              <tbody className="grid-sep">
+                <tr>
+                  <td className="sep-note" colSpan={dates.length + 1}>
+                    512 柜台 · 独立岗位，不与大厅岗位混排，不计入大厅在岗人数
+                  </td>
+                </tr>
+              </tbody>
+              <tbody>{counterPosts.map((post) => renderPostRow(post, true))}</tbody>
+            </>
+          )}
         </table>
 
         <div className="strip">
@@ -609,7 +692,7 @@ export default function Console({ data, weekStart, setData, notify }: Props) {
                     {names.map(({ id, type }) => {
                       const person = personById.get(id)
                       if (!person) return null
-                      const isLeader = plan.leaderId === id
+                      const isLeader = plan.leaderId === id || plan.counterLeaderId === id
                       return (
                         <span
                           key={id}
@@ -674,15 +757,15 @@ export default function Console({ data, weekStart, setData, notify }: Props) {
             <Icon d={ICON.info} size={11} />
           </span>
           <span className="tx">
-            <b>周六支援 {data.settings.supportSlots} 人顶岗</b>
-            <span>支援组日常在 512 柜台，不进本班表</span>
+            <b>周六 A/B 组隔周轮 · 整组上岗</b>
+            <span>512 柜台 {counterTotal} 人工作日常驻，周六不设此岗</span>
           </span>
         </div>
 
         <div className="railhd2">
           <Icon d={ICON.coin} />
-          调休台账 · 主班
-          <span className="rt">周六 +1 · 登记 −N</span>
+          轮休额度台账
+          <span className="rt">值班 +1 · 登记 −N</span>
         </div>
         <table className="ledger">
           <thead>
@@ -729,10 +812,7 @@ export default function Console({ data, weekStart, setData, notify }: Props) {
               <div key={row.name} className="bench">
                 <span className="lb">{row.name}</span>
                 <span className="tk">
-                  <span
-                    className={`fl${low ? ' low' : ''}`}
-                    style={{ width: `${pct}%` }}
-                  />
+                  <span className={`fl${low ? ' low' : ''}`} style={{ width: `${pct}%` }} />
                   <i style={{ left: `${(data.settings.restQuotaDays / 12) * 100}%` }} />
                 </span>
                 <span className={`vl${low ? ' low' : ''}`}>
@@ -741,7 +821,9 @@ export default function Console({ data, weekStart, setData, notify }: Props) {
               </div>
             )
           })}
-          <div className="note">口径：周日公休 + 表内不在岗登记（含年假）。竖线为目标。</div>
+          <div className="note">
+            口径：周日公休 + 表内不在岗登记（含年假）。竖线为目标。轮休额度当月用完，不结转。
+          </div>
         </div>
       </aside>
     </div>

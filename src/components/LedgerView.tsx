@@ -2,7 +2,7 @@ import { useEffect, useMemo, useState } from 'react'
 import type { Dispatch, FormEvent, SetStateAction } from 'react'
 import type { AppData, LeaveRecord, LeaveType, LedgerEntry } from '../types'
 import { countRestDays, leavesInMonth } from '../lib/scheduler'
-import { buildLedger, dutySummary, ledgerDaysForLeave, SOURCE_LABEL } from '../lib/leave'
+import { buildLedger, dutySummary, expiredQuota, ledgerDaysForLeave, SOURCE_LABEL } from '../lib/leave'
 import { currentMonth, diffDays, monthDates, shiftMonth, toISO } from '../lib/date'
 import { uid } from '../lib/store'
 
@@ -173,6 +173,15 @@ export default function LedgerView({ data, setData, month, onMonthChange }: Prop
     [people, data, dates],
   )
 
+  /** 本月还有额度未休掉的人数 */
+  const unusedCount = balanceStats.filter((b) => b.summary.balance > 0).length
+
+  /** 上月额度未用完（已清零）的人数 */
+  const expiredCount = useMemo(
+    () => people.filter((person) => expiredQuota(data, person.id, month) > 0).length,
+    [people, data, month],
+  )
+
   function submitLeave(e: FormEvent) {
     e.preventDefault()
     if (!personId) {
@@ -256,7 +265,7 @@ export default function LedgerView({ data, setData, month, onMonthChange }: Prop
                   {people.map((person) => (
                     <option key={person.id} value={person.id}>
                       {person.name}
-                      {person.pool === 'support' ? '（支援）' : ''}
+                      {person.pool === 'counter' ? '（512 柜台）' : ''}
                     </option>
                   ))}
                 </select>
@@ -390,6 +399,12 @@ export default function LedgerView({ data, setData, month, onMonthChange }: Prop
                   </tbody>
                 </table>
               )}
+              <div className="note">
+                周六与法定假日值班 1 天记 +1，登记调休 / 补休 1 天记 −N。额度必须当月休完，
+                月末未用完自动清零、不结转下月。
+                {unusedCount > 0 && ` 本月还有 ${unusedCount} 人有额度未休掉。`}
+                {expiredCount > 0 && ` 上月有 ${expiredCount} 人额度未用完已清零。`}
+              </div>
             </div>
           </div>
         </div>

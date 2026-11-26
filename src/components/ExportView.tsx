@@ -323,28 +323,20 @@ export default function ExportView({ data, setData, month, onMonthChange, weekSt
               />
             </div>
             <div className="field">
-              <label>周六支援位（人）</label>
-              <input
+              <label>首个周六值班组</label>
+              <select
                 className="input"
-                type="number"
-                min={0}
-                value={data.settings.supportSlots}
-                onChange={(e) => setSetting('supportSlots', Math.max(0, toInt(e.target.value, data.settings.supportSlots)))}
-              />
-            </div>
-            <div className="field">
-              <label>甲乙隔周轮换</label>
-              <button
-                className={`btn sm${data.settings.crewAlternate ? ' on' : ''}`}
-                style={{ width: 92 }}
-                onClick={() => setSetting('crewAlternate', !data.settings.crewAlternate)}
+                value={data.settings.firstTeam}
+                onChange={(e) => setSetting('firstTeam', e.target.value as AppData['settings']['firstTeam'])}
               >
-                {data.settings.crewAlternate ? '开' : '关'}
-              </button>
+                <option value="A">A 组</option>
+                <option value="B">B 组</option>
+              </select>
             </div>
           </div>
           <p className="note">
             最少在岗人数低于该值会在告警里标红；休息目标只用于月表提示，不参与排班计算。
+            周六与法定调休上班日由 A、B 两组隔周交替整组上岗，第一个值班组由上面选择。
           </p>
         </div>
       </div>

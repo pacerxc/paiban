@@ -560,6 +560,30 @@ body[data-theme='dark'] .posthd {
   margin-top: 2px;
 }
 
+/* ------------------------------------------- 512 柜台（独立岗）分隔块 */
+
+table.grid tbody.grid-sep td {
+  padding: 7px 12px;
+  background: #f1f2ef;
+  border-bottom: 1px solid var(--line-2);
+  border-right: 0;
+  font-size: 11px;
+  color: var(--ink-3);
+  letter-spacing: 0.02em;
+}
+
+body[data-theme='dark'] table.grid tbody.grid-sep td {
+  background: #1b1d21;
+}
+
+.posthd.sep {
+  background: #f1f2ef;
+}
+
+body[data-theme='dark'] .posthd.sep {
+  background: #1b1d21;
+}
+
 .cell {
   min-height: 42px;
   text-align: center;

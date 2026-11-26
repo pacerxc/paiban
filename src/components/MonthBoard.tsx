@@ -146,9 +146,9 @@ export default function MonthBoard({ data, month, onMonthChange }: Props) {
             </thead>
             <tbody>
               {summaries.map(({ person, rest, breakdown }) => {
-                const isSupport = person.pool === 'support'
+                const isCounter = person.pool === 'counter'
                 const diff = rest - quota
-                const low = !isSupport && diff < 0
+                const low = !isCounter && diff < 0
                 const balance = balanceByPerson.get(person.id) ?? 0
                 return (
                   <tr key={person.id}>
@@ -160,9 +160,9 @@ export default function MonthBoard({ data, month, onMonthChange }: Props) {
                           停用
                         </span>
                       ) : null}
-                      {isSupport ? (
+                      {isCounter ? (
                         <span className="chip support" style={{ marginLeft: 5 }}>
-                          {person.crew === 'B' ? '乙组' : '甲组'}
+                          {person.teamId ? `${person.teamId}组` : '512'}
                         </span>
                       ) : null}
                     </td>
@@ -178,11 +178,11 @@ export default function MonthBoard({ data, month, onMonthChange }: Props) {
                       className={`sum${low ? ' low' : ''}`}
                       title={`周日公休 ${breakdown.sunday} 天 · 轮空 ${breakdown.offDuty} 天 · 休假 ${breakdown.leave} 天`}
                     >
-                      {isSupport ? (
+                      {isCounter ? (
                         <>
                           <div>{rest} 天</div>
                           <div className="note" style={{ marginTop: 0 }}>
-                            支援组不计目标
+                            512 柜台不计目标
                           </div>
                         </>
                       ) : (
