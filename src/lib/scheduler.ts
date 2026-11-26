@@ -33,6 +33,8 @@ export interface DayPlan {
   resting: string[]
   /** 当天休假的人（personId） */
   onLeavePersonIds: string[]
+  /** 当天是本人「每周固定轮休日」的人（personId） */
+  restWeekdayPersonIds: string[]
   /** 当天休假的人 -> 休假类型 */
   leaveTypeByPerson: Map<string, LeaveRecord['type']>
   /** 每个岗位还差几个人（按当天实际位次数计算） */
@@ -44,13 +46,14 @@ export interface DayPlan {
   /** 当天在岗人数（不含独立岗 512） */
   onDuty: number
   /**
-   * 当天核心位次实到人数（不含 512，也不含机动岗）。
+   * 当天核心位次实到人数（不含 512，也不含机动岗与边境证）。
    *
-   * 「每日最少在岗 8 人」说的就是这 8 个核心位次；机动岗是补缺用的浮动岗，
-   * 把它算进基数会让缺岗永远看不出来，所以单独统计。
+   * 「每日最少在岗 8 人」说的就是这 8 个核心位次（复印1 受理2 校对2 扫描1 填表1 拍照1）；
+   * 机动岗是顶缺用的浮动岗，边境证是机动有余力时兼做的，把它算进基数会让缺岗永远看不出来，
+   * 所以单独统计。
    */
   coreOnDuty: number
-  /** 当天核心位次总数（机动岗 0~3 与 512 都不计） */
+  /** 当天核心位次总数（机动岗、边境证与 512 都不计） */
   coreCapacity: number
   /** 当天值班组长（大厅，不在岗时为 null） */
   leaderId: string | null
@@ -159,36 +162,96 @@ function fixedPostIds(data: AppData): Set<string> {
   return ids
 }
 
+/* ------------------------------------------------------------------ *
+ * 平日轮转环
+ * ------------------------------------------------------------------ */
+
 /**
- * 工作日轮转池：大厅主班池中「没有固定岗」的人。
+ * 轮转环的位次表：按岗位顺序展开，每个岗位占 capacity 个位次。
  *
- * 顺序 = 平日轮转顺序（AppData.weekdayOrder），可在「人员」页拖拽调整。
- * 名单里没排上的人（后加入轮转池）按 order 追加到末尾。
+ * 真实班表的位次链是 101 → 102 → 103 → 104 → 105 → 106 → 填表，
+ * 正好是「一号台1 受理2 校对2 扫描1 填表1」展开来的 7 个位次。
  */
-export function rotationPool(data: AppData): Person[] {
-  const index = new Map<string, number>()
-  const order = data.weekdayOrder ?? []
-  order.forEach((id, i) => {
-    if (!index.has(id)) index.set(id, i)
-  })
-  return data.people
-    .filter((p) => p.active && p.pool === 'main' && !p.fixedPostId)
-    .sort((a, b) => {
-      const ta = index.get(a.id)
-      const tb = index.get(b.id)
-      if (ta !== undefined && tb !== undefined) return ta - tb
-      if (ta !== undefined) return -1
-      if (tb !== undefined) return 1
-      return a.order - b.order
-    })
+export function ringSlots(data: AppData): string[] {
+  const slots: string[] = []
+  for (const post of data.posts) {
+    if (!post.ringSlot) continue
+    for (let i = 0; i < post.capacity; i++) slots.push(post.id)
+  }
+  return slots
 }
 
-/** 工作日轮转位次的岗位顺序（一号台 → 校对 → 扫描），机动岗吸收剩余 */
-function weekdayRotationPosts(data: AppData): Post[] {
-  const fixed = fixedPostIds(data)
-  return hallPosts(data).filter(
-    (p) => !fixed.has(p.id) && p.flexMode !== 'leftover' && p.capacity > 0,
-  )
+/** 某一周的环状态 */
+export interface RingSnapshot {
+  /** 环成员，顺序即位次顺序（members[0] 站 101 位，members[6] 站填表位） */
+  members: string[]
+  /** 机动/候补池，顺序即顶岗优先级 */
+  standby: string[]
+}
+
+/** 环推进：整体右移一位 —— 机动池队首补进 101 位，填表位的人离环回到池尾 */
+function advanceRing(members: string[], standby: string[]): void {
+  if (members.length === 0) return
+  const out = members.pop()!
+  if (standby.length > 0) members.unshift(standby.shift()!)
+  standby.push(out)
+}
+
+/** 环回退：advanceRing 的逆操作 */
+function rewindRing(members: string[], standby: string[]): void {
+  if (members.length === 0) return
+  const head = members.shift()!
+  const tail = standby.pop()
+  if (tail !== undefined) members.push(tail)
+  standby.unshift(head)
+}
+
+const ringCache = new WeakMap<object, Map<number, RingSnapshot>>()
+
+/**
+ * 某一日期所在周的环状态。
+ *
+ * 以 AppData.ring.anchorDate 为基准按周推进：锚点之后的每一周，
+ * 7 个位次整体右移一位，101 位由机动池队首补入，填表位的人离环回到池尾。
+ */
+export function ringAt(data: AppData, date: string): RingSnapshot {
+  const anchor = data.ring?.anchorDate ?? data.settings.startDate
+  const steps = weekIndexOf(anchor, date)
+  let cache = ringCache.get(data)
+  if (!cache) {
+    cache = new Map()
+    ringCache.set(data, cache)
+  }
+  const hit = cache.get(steps)
+  if (hit) return hit
+
+  const members = [...(data.ring?.members ?? [])]
+  const standby = [...(data.ring?.standby ?? [])]
+  if (steps >= 0) {
+    for (let i = 0; i < steps; i++) advanceRing(members, standby)
+  } else {
+    for (let i = 0; i < -steps; i++) rewindRing(members, standby)
+  }
+  const snapshot: RingSnapshot = { members, standby }
+  cache.set(steps, snapshot)
+  return snapshot
+}
+
+/** 环成员（按位次顺序） */
+export function ringMembers(data: AppData): Person[] {
+  const ids = data.ring?.members ?? []
+  return ids.map((id) => data.people.find((p) => p.id === id)).filter((p): p is Person => !!p)
+}
+
+/** 机动/候补池（按顶岗优先级） */
+export function ringStandby(data: AppData): Person[] {
+  const ids = data.ring?.standby ?? []
+  return ids.map((id) => data.people.find((p) => p.id === id)).filter((p): p is Person => !!p)
+}
+
+/** 边境证（107）岗位 */
+export function borderPost(data: AppData): Post | undefined {
+  return data.posts.find((p) => p.optional && !p.separate)
 }
 
 /** 浮动岗（机动）：位次取剩余可用人数 */
@@ -270,11 +333,33 @@ function addDaysLocal(date: string, days: number): string {
 interface Ctx {
   active: Person[]
   leaveSet: Set<string>
+  /** 当天不上岗的人 = 休假 + 每周固定轮休 */
+  offSet: Set<string>
+  /** 当天是本人「每周固定轮休日」的人 */
+  restWeekdaySet: Set<string>
   leaveTypeByPerson: Map<string, LeaveRecord['type']>
   onLeavePersonIds: string[]
   byPerson: Map<string, string | null>
   /** 岗位位次：postId -> 已占用的人员 */
   slotOwner: Map<string, string[]>
+}
+
+/**
+ * 当天轮休的人：固定轮休日落在这一工作日的人。
+ *
+ * 周六值班与周日公休不排轮休 —— 值班日是整组上岗，轮休只作用于周一至周五。
+ */
+export function restWeekdayIds(data: AppData, date: string): Set<string> {
+  const day = parseISO(date).getDay()
+  if (day === 0 || day === 6) return new Set()
+  const index = (day + 6) % 7 // 周一 = 0
+  const set = new Set<string>()
+  for (const person of data.people) {
+    if (!person.active) continue
+    if (person.restWeekday === null || person.restWeekday === undefined) continue
+    if (person.restWeekday === index) set.add(person.id)
+  }
+  return set
 }
 
 /** 把某人放进某个岗位的第一个空位 */
@@ -303,9 +388,15 @@ export function planDay(data: AppData, date: string): DayPlan {
     }
   }
 
+  const leaveSet = new Set(onLeavePersonIds)
+  const restWeekdaySet = state.working ? restWeekdayIds(data, date) : new Set<string>()
+  const offSet = new Set<string>([...leaveSet, ...restWeekdaySet])
+
   const ctx: Ctx = {
     active,
-    leaveSet: new Set(onLeavePersonIds),
+    leaveSet,
+    offSet,
+    restWeekdaySet,
     leaveTypeByPerson,
     onLeavePersonIds,
     byPerson: new Map<string, string | null>(),
@@ -337,7 +428,7 @@ export function planDay(data: AppData, date: string): DayPlan {
       for (const personId of slots) {
         if (!personId || assigned.has(personId)) continue
         const person = active.find((p) => p.id === personId)
-        if (!person || ctx.leaveSet.has(personId)) continue
+        if (!person || ctx.offSet.has(personId)) continue
         assigned.add(personId)
         ctx.byPerson.set(personId, post.id)
         const owners = ctx.slotOwner.get(post.id) ?? []
@@ -347,8 +438,8 @@ export function planDay(data: AppData, date: string): DayPlan {
     }
   }
 
-  // 休假优先级最高
-  for (const personId of ctx.leaveSet) ctx.byPerson.set(personId, null)
+  // 休假与轮休优先级最高
+  for (const personId of ctx.offSet) ctx.byPerson.set(personId, null)
 
   const leaderId = resolveLeader(data, date, ctx.byPerson)
   const counterLeaderId = resolveCounterLeader(data, ctx.byPerson)
@@ -369,123 +460,174 @@ export function planDay(data: AppData, date: string): DayPlan {
 }
 
 /* ------------------------------------------------------------------ *
- * 工作日：固定岗 + 512 + 轮转
+ * 工作日：固定岗 + 轮转环 + 机动顶岗
  * ------------------------------------------------------------------ */
 
 function planWeekday(data: AppData, date: string, ctx: Ctx): void {
-  const onDuty = ctx.active.filter((p) => !ctx.leaveSet.has(p.id))
+  const onDuty = ctx.active.filter((p) => !ctx.offSet.has(p.id))
 
   // 1) 512 柜台：柜台常驻人员全部在 512（独立岗，不计入大厅在岗）
   const counterPost = separatePosts(data)[0]
   if (counterPost) {
-    const counters = onDuty.filter((p) => p.pool === 'counter')
-    for (const person of counters) {
+    for (const person of onDuty) {
+      if (person.pool !== 'counter') continue
       place(ctx, person.id, counterPost.id, counterPost.capacity)
     }
   }
 
-  // 2) 固定岗：周娟/贺夏炎 -> 受理，颜贞贞 -> 照相，杨雯 -> 填表
-  const fixedIds = fixedPostIds(data)
+  // 2) 固定岗：真实班表里只有「拍照」是固定岗，缺人时由机动顶上
+  //    轮转位次（一号台/受理/校对/扫描/填表）一律由轮转环决定，
+  //    把人指到这些位次当固定岗会跟环抢人，直接忽略。
+  const fixedPosts = fixedPostIds(data)
+  const fixedSlots: string[] = []
+  for (const post of data.posts) {
+    if (post.separate || post.ringSlot) continue
+    if (!fixedPosts.has(post.id)) continue
+    for (let i = 0; i < post.capacity; i++) fixedSlots.push(post.id)
+  }
   for (const person of onDuty) {
     if (!person.fixedPostId) continue
     const post = data.posts.find((p) => p.id === person.fixedPostId)
     if (!post) continue
+    if (post.ringSlot) continue
     place(ctx, person.id, post.id, post.capacity)
   }
 
-  // 3) 轮转池：每周整体顺移一位
-  const rotators = rotationPool(data)
-  const weekIndex = Math.floor(weekIndexOf(data.settings.startDate, date))
-  const phase = rotators.length ? ((weekIndex % rotators.length) + rotators.length) % rotators.length : 0
-  const ordered = rotators.map((_, i) => rotators[(phase + i) % rotators.length])
-
-  const rotationPosts = weekdayRotationPosts(data)
-  const coreSlots: string[] = []
-  for (const post of rotationPosts) {
-    for (let i = 0; i < post.capacity; i++) coreSlots.push(post.id)
-  }
-  const floatPost = leftoverPost(data)
-  const floatSlots: string[] = []
-  if (floatPost) {
-    const floatCapacity = Math.max(0, Math.min(floatPost.capacity, ordered.length - coreSlots.length))
-    for (let i = 0; i < floatCapacity; i++) floatSlots.push(floatPost.id)
-  }
-
-  // 按位次依次落人；轮休/请假的人留空
-  const slotOwners: Array<string | null> = new Array(coreSlots.length + floatSlots.length).fill(null)
-  const allSlots = [...coreSlots, ...floatSlots]
-  ordered.forEach((person, i) => {
-    if (i >= allSlots.length) return
-    if (ctx.leaveSet.has(person.id)) return
-    slotOwners[i] = person.id
-  })
-
-  // 4) 补位：机动顶上临时有事的人的空岗
-  const vacancyOrder: string[] = []
-  for (let i = 0; i < coreSlots.length; i++) {
-    if (!slotOwners[i]) vacancyOrder.push(coreSlots[i])
-  }
-  // 固定岗缺人（周娟/贺夏炎/颜贞贞/杨雯 休假）也由机动顶上
-  for (const post of hallPosts(data)) {
-    if (!fixedIds.has(post.id)) continue
-    const owners = ctx.slotOwner.get(post.id) ?? []
-    const missing = post.capacity - owners.length
-    for (let i = 0; i < missing; i++) vacancyOrder.push(post.id)
-  }
-
-  const floaters: string[] = []
-  for (let i = coreSlots.length; i < slotOwners.length; i++) {
-    const owner = slotOwners[i]
-    if (owner) floaters.push(owner)
-  }
-
-  const used = new Set<string>()
-  for (const postId of vacancyOrder) {
-    const floater = floaters.find((id) => !used.has(id))
-    if (!floater) break
-    used.add(floater)
-    const index = slotOwners.findIndex((owner, i) => i >= coreSlots.length && owner === floater)
-    if (index >= 0) slotOwners[index] = null
-    const target = slotOwners.findIndex((owner, i) => i < coreSlots.length && owner === null && coreSlots[i] === postId)
-    if (target < 0) {
-      // 固定岗的空位：直接追加
-      const owners = ctx.slotOwner.get(postId) ?? []
-      owners.push(floater)
-      ctx.slotOwner.set(postId, owners)
-      ctx.byPerson.set(floater, postId)
-      continue
+  // 3) 环成员按位次落位：members[0] 站 101 位，members[6] 站填表位
+  const slots = ringSlots(data)
+  const { members, standby } = ringAt(data, date)
+  const slotOwner = new Array<string | null>(slots.length).fill(null)
+  // 环里没落到位的人（位次被别人占了、或环比位次多）退回机动池顶岗
+  const displaced: string[] = []
+  members.forEach((personId, i) => {
+    if (!personId) return
+    if (ctx.offSet.has(personId)) return
+    if (ctx.byPerson.get(personId)) return
+    if (i >= slots.length) {
+      displaced.push(personId)
+      return
     }
-    slotOwners[target] = floater
-  }
-
-  // 写回位次
-  allSlots.forEach((postId, i) => {
-    const owner = slotOwners[i]
-    if (!owner) return
+    const postId = slots[i]
+    const post = data.posts.find((p) => p.id === postId)
     const owners = ctx.slotOwner.get(postId) ?? []
-    owners.push(owner)
-    ctx.slotOwner.set(postId, owners)
-    ctx.byPerson.set(owner, postId)
+    if (post && owners.length >= post.capacity) {
+      displaced.push(personId)
+      return
+    }
+    slotOwner[i] = personId
   })
 
-  // 剩余机动人员紧凑排列（避免机动中间出现空洞）
-  if (floatPost) {
-    const remaining = floaters.filter((id) => !used.has(id))
-    const owners = ctx.slotOwner.get(floatPost.id) ?? []
-    const compacted = owners.filter((id) => !used.has(id))
-    while (compacted.length < remaining.length) {
-      const next = owners.find((id) => !compacted.includes(id) && !used.has(id))
-      if (!next) break
-      compacted.push(next)
+  // 4) 机动池：顶岗优先级 = 环内落不了位的人 → 机动池顺序 → 环外的大厅主班人员
+  const ringIds = new Set(members)
+  const pool: string[] = []
+  for (const id of displaced) {
+    if (ctx.offSet.has(id)) continue
+    if (ctx.byPerson.get(id)) continue
+    if (pool.includes(id)) continue
+    pool.push(id)
+  }
+  for (const id of standby) {
+    if (ringIds.has(id)) continue
+    pool.push(id)
+  }
+  for (const person of onDuty) {
+    if (person.pool !== 'main') continue
+    if (ringIds.has(person.id) || pool.includes(person.id)) continue
+    if (ctx.byPerson.get(person.id)) continue
+    pool.push(person.id)
+  }
+
+  // 5) 边境证（107）：机动有余力时由机动里第一位顶上；用户也可以在班表上拖拽对调
+  const border = borderPost(data)
+
+  // 6) 顶岗：环位次的空位在前，固定岗缺岗在后，机动池按顺序出人
+  const vacancies: Array<{ postId: string; index: number }> = []
+  for (let i = 0; i < slotOwner.length; i++) {
+    if (!slotOwner[i]) vacancies.push({ postId: slots[i], index: i })
+  }
+  for (const postId of fixedSlots) {
+    const owners = ctx.slotOwner.get(postId) ?? []
+    const need = fixedSlots.filter((x) => x === postId).length
+    for (let k = owners.length; k < need; k++) vacancies.push({ postId, index: -1 })
+  }
+
+  let cursor = 0
+  const takePool = (): string | null => {
+    while (cursor < pool.length) {
+      const id = pool[cursor++]
+      if (ctx.offSet.has(id)) continue
+      if (ctx.byPerson.get(id)) continue
+      return id
     }
-    ctx.slotOwner.set(floatPost.id, compacted.slice(0, floatSlots.length))
-    for (const id of compacted) ctx.byPerson.set(id, floatPost.id)
+    return null
+  }
+
+  for (const vac of vacancies) {
+    const personId = takePool()
+    if (!personId) break
+    if (vac.index >= 0) {
+      slotOwner[vac.index] = personId
+    } else {
+      const owners = ctx.slotOwner.get(vac.postId) ?? []
+      owners.push(personId)
+      ctx.slotOwner.set(vac.postId, owners)
+      ctx.byPerson.set(personId, vac.postId)
+    }
+  }
+
+  // 写回环位次：每个岗位按位次顺序排列（102 排在 103 前面）
+  for (const post of data.posts) {
+    if (!post.ringSlot) continue
+    const owners: string[] = []
+    slots.forEach((postId, i) => {
+      if (postId !== post.id) return
+      const owner = slotOwner[i]
+      if (!owner) return
+      owners.push(owner)
+      ctx.byPerson.set(owner, post.id)
+    })
+    ctx.slotOwner.set(post.id, owners)
+  }
+
+  // 7) 边境证：机动里第一位有余力的人顶上
+  if (border) {
+    for (const id of pool) {
+      if (ctx.offSet.has(id)) continue
+      if (ctx.byPerson.get(id)) continue
+      place(ctx, id, border.id, border.capacity)
+      break
+    }
+  }
+
+  // 8) 机动：池里剩下的人待命（对应真实班表的「816 顶班待命」行）
+  const floatPost = leftoverPost(data)
+  if (floatPost) {
+    for (const id of pool) {
+      if (ctx.offSet.has(id)) continue
+      if (ctx.byPerson.get(id)) continue
+      place(ctx, id, floatPost.id, Number.MAX_SAFE_INTEGER)
+    }
   }
 }
 
 /* ------------------------------------------------------------------ *
  * 周六 / 法定调休上班日：值班组整组上岗
  * ------------------------------------------------------------------ */
+
+/**
+ * 周六的 8 个核心位次：按岗位顺序展开 saturdayCapacity。
+ *
+ * 真实班表的周六编制与工作日一致 —— 复印1 受理2 校对2 扫描1 填表1 拍照1，
+ * 不设机动、不设边境证、不开 512 柜台。
+ */
+function dutySlotList(data: AppData): string[] {
+  const slots: string[] = []
+  for (const post of data.posts) {
+    if (post.separate || post.optional || post.flexMode === 'leftover') continue
+    for (let i = 0; i < post.saturdayCapacity; i++) slots.push(post.id)
+  }
+  return slots
+}
 
 function planDutyDay(data: AppData, date: string, ctx: Ctx): void {
   const teamId = dutyTeamOf(data, date)
@@ -495,42 +637,43 @@ function planDutyDay(data: AppData, date: string, ctx: Ctx): void {
   // B 组少一人，向 A 组借一个
   const order: Person[] = [...onDuty]
   const borrowed = borrowedFrom(data, date)
-  if (borrowed && !ctx.leaveSet.has(borrowed.id) && borrowed.active) {
+  if (
+    borrowed &&
+    !ctx.leaveSet.has(borrowed.id) &&
+    borrowed.active &&
+    !order.some((p) => p.id === borrowed.id)
+  ) {
     order.push(borrowed)
   }
 
-  const dutyPosts = hallPosts(data).filter((p) => p.saturdayCapacity > 0)
-  const capOf = (postId: string) => data.posts.find((p) => p.id === postId)?.saturdayCapacity ?? 0
+  const dutySlots = dutySlotList(data)
+  const slotOwner = new Array<string | null>(dutySlots.length).fill(null)
 
-  // 1) 固定岗优先
+  // 1) 固定岗优先（拍照）
   for (const person of order) {
     if (!person.fixedPostId) continue
-    const post = data.posts.find((p) => p.id === person.fixedPostId)
-    if (!post) continue
-    place(ctx, person.id, post.id, capOf(post.id))
+    const index = dutySlots.findIndex((postId, i) => postId === person.fixedPostId && !slotOwner[i])
+    if (index < 0) continue
+    slotOwner[index] = person.id
   }
 
-  // 2) 512 柜台人员优先排填表岗（组内 2 人去支援）
+  // 2) 其余人员按组内顺序填剩下的位次
   for (const person of order) {
-    if (person.pool !== 'counter') continue
-    const form = data.posts.find((p) => p.name === '填表')
-    if (form && place(ctx, person.id, form.id, capOf(form.id))) continue
-    const fallbacks = dutyPosts.filter((p) => p.name !== '照相')
-    for (const post of fallbacks) {
-      if (place(ctx, person.id, post.id, capOf(post.id))) break
-    }
+    if (slotOwner.includes(person.id)) continue
+    const index = slotOwner.findIndex((owner) => !owner)
+    if (index < 0) break
+    slotOwner[index] = person.id
   }
 
-  // 3) 其余人员按组内顺序填剩余位次（照相放最后，用于顶替）
-  const priority = dutyPosts.filter((p) => p.name !== '照相')
-  const lastPosts = dutyPosts.filter((p) => p.name === '照相')
-  const queue = [...priority, ...lastPosts]
-  for (const person of order) {
-    if (ctx.byPerson.get(person.id)) continue
-    for (const post of queue) {
-      if (place(ctx, person.id, post.id, capOf(post.id))) break
-    }
-  }
+  // 3) 写回位次
+  dutySlots.forEach((postId, i) => {
+    const owner = slotOwner[i]
+    if (!owner) return
+    const owners = ctx.slotOwner.get(postId) ?? []
+    owners.push(owner)
+    ctx.slotOwner.set(postId, owners)
+    ctx.byPerson.set(owner, postId)
+  })
 }
 
 /* ------------------------------------------------------------------ *
@@ -554,7 +697,8 @@ export function counterLeaderPool(data: AppData): Person[] {
 /**
  * 当天大厅值班组长：
  * 1. 优先取手工指定（dayLeaders）
- * 2. 否则按 王玉花 -> 杨娟 -> 汪甜 的顺序逐日轮值，跳过当天不在岗的人
+ * 2. 否则按组长候选顺序「一周一人」—— 按周轮值，跳过当天不在岗的人，
+ *    也就是本人休假时由下一位在岗的组长代班（对应真实班表的「某天他人代班」）
  * 3. 若当天没有任何在岗组长则返回 null（触发「组长位次空缺」告警）
  */
 export function resolveLeader(
@@ -568,7 +712,7 @@ export function resolveLeader(
   const manual = data.dayLeaders[date]
   if (manual && byPerson.has(manual)) return byPerson.get(manual) ? manual : null
 
-  const phase = leaderPhase(data, date)
+  const phase = leaderWeekPhase(data, date)
   for (let i = 0; i < pool.length; i++) {
     const candidate = pool[(phase + i) % pool.length]
     if (byPerson.get(candidate.id)) return candidate.id
@@ -588,12 +732,12 @@ export function resolveCounterLeader(
   return null
 }
 
-/** 组长轮值相位：逐日推进，王玉花 -> 杨娟 -> 汪甜 */
-function leaderPhase(data: AppData, date: string): number {
+/** 组长轮值相位：按周推进，一周一人（王玉花 → 杨娟 → 汪甜 循环） */
+function leaderWeekPhase(data: AppData, date: string): number {
   const pool = leaderPool(data)
   if (pool.length === 0) return 0
-  const dayIndex = diffDays(startOfWeek(data.settings.startDate), date)
-  return (((dayIndex % pool.length) + pool.length) % pool.length)
+  const weekIndex = Math.floor(weekIndexOf(data.settings.startDate, date))
+  return ((weekIndex % pool.length) + pool.length) % pool.length
 }
 
 interface BuildArgs {
@@ -612,11 +756,12 @@ interface BuildArgs {
 function buildPlan(args: BuildArgs): DayPlan {
   const { data, date, state, ctx } = args
 
+  // 岗位人员按「位次顺序」排列 —— 受理岗的第 1 位是 102、第 2 位是 103，
+  // 不能按名单顺序排，否则同一岗位的两位次会串位。
   const byPost = new Map<string, string[]>()
-  for (const post of data.posts) byPost.set(post.id, [])
-  for (const person of ctx.active) {
-    const postId = ctx.byPerson.get(person.id)
-    if (postId && byPost.has(postId)) byPost.get(postId)!.push(person.id)
+  for (const post of data.posts) {
+    const owners = ctx.slotOwner.get(post.id) ?? []
+    byPost.set(post.id, owners.filter((id) => ctx.byPerson.get(id)))
   }
 
   // 实际位次数：固定岗用编制，浮动岗按当天实际人数
@@ -650,7 +795,8 @@ function buildPlan(args: BuildArgs): DayPlan {
   for (const post of data.posts) {
     if (post.separate) continue
     capacity += slotCount.get(post.id)!
-    if (post.flexMode !== 'leftover') coreCapacity += slotCount.get(post.id)!
+    // 核心位次 = 8 个大厅固定编制位次；机动岗与边境证都不计入基数
+    if (post.flexMode !== 'leftover' && !post.optional) coreCapacity += slotCount.get(post.id)!
   }
   for (const person of ctx.active) {
     const postId = ctx.byPerson.get(person.id)
@@ -658,7 +804,7 @@ function buildPlan(args: BuildArgs): DayPlan {
     const post = data.posts.find((p) => p.id === postId)
     if (post?.separate) continue
     onDuty++
-    if (post && post.flexMode !== 'leftover') coreOnDuty++
+    if (post && post.flexMode !== 'leftover' && !post.optional) coreOnDuty++
   }
 
   return {
@@ -671,6 +817,7 @@ function buildPlan(args: BuildArgs): DayPlan {
     byPost,
     resting,
     onLeavePersonIds: ctx.onLeavePersonIds,
+    restWeekdayPersonIds: [...ctx.restWeekdaySet],
     leaveTypeByPerson: ctx.leaveTypeByPerson,
     vacant,
     slotCount,
@@ -950,7 +1097,7 @@ export function manualOrPickedLeaderName(data: AppData, date: string): string | 
   }
   const pool = leaderPool(data)
   if (pool.length === 0) return null
-  return pool[leaderPhase(data, date)].name
+  return pool[leaderWeekPhase(data, date)].name
 }
 
 function shortDate(date: string): string {

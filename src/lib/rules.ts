@@ -65,12 +65,27 @@ function fixedPostIds(data: AppData): Set<string> {
   return ids
 }
 
-/** 值班日（周六 / 法定调休）大厅的位次总数：一号台2 + 受理3 + 填表2 + 照相1 = 8 */
+/**
+ * 值班日（周六 / 法定调休）大厅的位次总数。
+ *
+ * 真实班表的周六编制与工作日一致：复印1 受理2 校对2 扫描1 填表1 拍照1 = 8 个位次，
+ * 不设机动、不设边境证、不开 512 柜台。
+ */
 function dutyHallSlots(data: AppData): number {
   let total = 0
   for (const post of data.posts) {
     if (post.separate) continue
     total += post.saturdayCapacity
+  }
+  return total
+}
+
+/** 轮转环应有的位次数：参与轮转的岗位按编制展开 */
+function ringSlotCount(data: AppData): number {
+  let total = 0
+  for (const post of data.posts) {
+    if (!post.ringSlot) continue
+    total += post.capacity
   }
   return total
 }
@@ -87,6 +102,8 @@ interface Context {
   people: Map<string, Person>
   posts: Map<string, Post>
   add: (v: RuleViolation) => void
+  /** 配置类问题只提示一次 */
+  reported: boolean
 }
 
 /** 休假期间不排班 */
@@ -143,6 +160,19 @@ function checkPeople(ctx: Context): void {
         title,
         rule: '固定岗位人员只能上本岗。',
         fix: `换回「${postNameOf(posts, person.fixedPostId)}」岗，或到「人员」页取消${name}的固定岗设置。`,
+      })
+    }
+
+    // 轮休日不上岗
+    if (plan.restWeekdayPersonIds.includes(personId)) {
+      add({
+        level: 'error',
+        date,
+        personId,
+        postId,
+        title: `${title}（当天是${name}的轮休日）`,
+        rule: '每周固定轮休日不上岗。',
+        fix: `把${name}从当天排班里撤下，或到「人员」页改掉她的固定轮休日。`,
       })
     }
 
@@ -398,6 +428,26 @@ function checkCounterStaffing(ctx: Context): void {
   }
 }
 
+/**
+ * 轮转环人数不足：环上的人少了，机动池要补的位次就多。
+ *
+ * 这是配置层面的问题，只在区间内第一个上班日提示一次。
+ */
+function checkRingStaffing(ctx: Context, expected: number): void {
+  const { date, label, data, add } = ctx
+  if (ctx.reported) return
+  const count = data.ring?.members.length ?? 0
+  if (count >= expected) return
+  ctx.reported = true
+  add({
+    level: 'warn',
+    date,
+    title: `${label} · 轮转环只有 ${count} 人（应为 ${expected} 人）`,
+    rule: '轮转环应按位次配满，缺的人由机动池顶上。',
+    fix: `到「人员」页的「平日轮转环」补齐 ${expected - count} 人，或从机动池里把队首的人拖进环内。`,
+  })
+}
+
 /* ------------------------------------------------------------------ *
  * 入口
  * ------------------------------------------------------------------ */
@@ -412,6 +462,7 @@ export function checkRules(data: AppData, dates: string[]): RuleViolation[] {
   const fixedPosts = fixedPostIds(data)
   const min = data.settings.minDailyHeadcount
   const dutySlots = dutyHallSlots(data)
+  const ringSlots = ringSlotCount(data)
 
   const add = (v: RuleViolation): void => {
     violations.push(v)
@@ -429,6 +480,7 @@ export function checkRules(data: AppData, dates: string[]): RuleViolation[] {
       people,
       posts,
       add,
+      reported: false,
     }
 
     checkLeave(ctx)
@@ -441,6 +493,7 @@ export function checkRules(data: AppData, dates: string[]): RuleViolation[] {
     checkDutySlots(ctx, dutySlots)
     checkLeader(ctx)
     checkCounterStaffing(ctx)
+    checkRingStaffing(ctx, ringSlots)
   }
 
   violations.sort((a, b) => {

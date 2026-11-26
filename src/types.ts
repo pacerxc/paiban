@@ -26,20 +26,22 @@ export interface Person {
   canLead: boolean
   /** 组长管辖范围；非组长为 undefined */
   leaderScope?: LeaderScope
-  /** 组长轮值顺序，从 1 开始；大厅组长按 王玉花 → 杨娟 → 汪甜 逐日轮 */
+  /** 组长候选顺序，从 1 开始；一周一人按周轮值，当天不在岗时由下一位代班 */
   leaderOrder?: number
   /** null 表示可以上全部岗位，否则只允许数组内的岗位 */
   allowedPostIds: string[] | null
-  /** 固定岗位：只排这一个岗，休息时由机动岗顶上 */
+  /** 固定岗位：只排这一个岗，缺岗时由机动顶上（真实班表里只有「拍照」是固定岗） */
   fixedPostId: string | null
+  /** 每周固定轮休日：0 = 周一 … 4 = 周五；null = 不轮休 */
+  restWeekday?: number | null
   active: boolean
   note?: string
 }
 
 /**
  * 浮动岗的位次计算方式：
- * - leftover：位次取「剩余可用人数」（机动岗，吸收轮转池里多出来的人）
- * - available：位次取「该岗可用人数」（512 柜台，有人休假就少人）
+ * - leftover：位次取「剩余可用人数」（机动岗，吸收机动池里多出来的人）
+ * - available：位次取「该岗可用人数」（512 柜台、边境证，有人休假就少人）
  */
 export type FlexMode = 'leftover' | 'available'
 
@@ -55,6 +57,32 @@ export interface Post {
   separate?: boolean
   /** 浮动岗：位次数按当天实际情况计算 */
   flexMode?: FlexMode
+  /** 参与平日轮转环：按岗位顺序展开 capacity 个位次，环成员每周整体右移一位 */
+  ringSlot?: boolean
+  /** 非核心位次：不计入「每日最少在岗」的基数（边境证） */
+  optional?: boolean
+  /** 真实表格里的行标签，例：「101（复印）」 */
+  hint?: string
+  /** 每个位次在真实表格里的标签，例：受理岗 = ['102（受理）', '103（受理）'] */
+  slotHints?: string[]
+}
+
+/**
+ * 平日轮转环。
+ *
+ * 真实班表的轮转规律：7 个位次（101 → 102 → 103 → 104 → 105 → 106 → 填表）
+ * 每周整体右移一位；101 位是入口，由机动/候补池的队首补入；填表位是出口，
+ * 当周在填表的人离环回到池尾。
+ *
+ * `members` 的顺序即位次顺序（members[0] 站 101 位，members[6] 站填表位）。
+ */
+export interface RingState {
+  /** 锚点周（周一）：该周的环状态是基准，往前后按周推进 */
+  anchorDate: string
+  /** 环成员（有序，7 人） */
+  members: string[]
+  /** 机动/候补池（有序）：队首优先补进 101 位，出环的人回到队尾 */
+  standby: string[]
 }
 
 export type LeaveType = '调休' | '补休' | '年假' | '病假' | '事假' | '其他'
@@ -92,11 +120,11 @@ export interface AppData {
   version: number
   settings: {
     orgName: string
-    /** 轮转起始周（周一） */
+    /** 轮转起始周（周一）：值班组交替与组长轮值都以它为相位零点 */
     startDate: string
     /** 每人每月休息目标天数 */
     restQuotaDays: number
-    /** 每日最少在岗人数（不含 512 柜台） */
+    /** 每日最少在岗人数（不含 512 柜台、机动岗与边境证） */
     minDailyHeadcount: number
     /** 第一个周六值班组：A / B，之后隔周交替 */
     firstTeam: TeamId
@@ -104,13 +132,8 @@ export interface AppData {
   people: Person[]
   posts: Post[]
   teams: Team[]
-  /**
-   * 平日轮转顺序（人员 id 数组）。
-   *
-   * 决定工作日「一号台 → 校对 → 扫描 → 机动」的每周整体顺移，
-   * 与值班班组名单顺序相互独立：改 A/B 组名单不影响平日轮转。
-   */
-  weekdayOrder: string[]
+  /** 平日轮转环：7 个位次每周整体右移一位 */
+  ring: RingState
   /** 节假日等单日状态覆盖：日期 -> 上班 / 放假 */
   days: Record<string, DayState>
   /** 逐日岗位安排覆盖：日期 -> 岗位id -> 位次槽位（人员id 或 null 表示空缺） */

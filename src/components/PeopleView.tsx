@@ -1,8 +1,8 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import type { Dispatch, DragEvent, SetStateAction } from 'react'
 import type { AppData, LeaderScope, Person, Pool, Team, TeamId } from '../types'
-import { POST_COLORS, defaultWeekdayOrder, uid } from '../lib/store'
-import { rotationPool } from '../lib/scheduler'
+import { POST_COLORS, defaultRing, uid } from '../lib/store'
+import { ringMembers, ringStandby } from '../lib/scheduler'
 
 interface Props {
   data: AppData
@@ -24,14 +24,17 @@ interface ToastState {
 
 /**
  * 拖拽来源。
- * - weekday：平日轮转顺序里的某个人
+ * - ring：轮转环 / 机动池里的某个人（两个区之间可以互拖）
  * - team：值班班组组内排序的某个人（只能在同一个组内拖）
  */
 type DragSource =
-  | { kind: 'weekday'; personId: string }
+  | { kind: 'ring'; zone: 'ring' | 'standby'; personId: string }
   | { kind: 'team'; teamId: TeamId; personId: string }
 
 const TEAM_IDS: TeamId[] = ['A', 'B']
+
+/** 每周固定轮休日的候选项（值 0 = 周一 … 4 = 周五） */
+const REST_WEEKDAYS = ['周一', '周二', '周三', '周四', '周五']
 
 function teamName(id: TeamId): string {
   return id === 'A' ? 'A组' : 'B组'
@@ -268,15 +271,35 @@ export default function PeopleView({ data, setData }: Props) {
     [people],
   )
 
-  /** 工作日轮转池（大厅主班池中无固定岗的人），顺序 = data.weekdayOrder */
-  const rotators = useMemo(() => rotationPool(data), [data.people, data.weekdayOrder])
+  /** 轮转环成员（7 个位次，顺序即位次顺序） */
+  const ringList = useMemo(() => ringMembers(data), [data])
 
-  /** 当前平日顺序是否已经等于默认值（用于禁用「恢复默认」） */
-  const weekdayOrderIsDefault = useMemo(() => {
-    const current = rotators.map((p) => p.id)
-    const fallback = defaultWeekdayOrder(data.people, data.teams)
-    return current.length === fallback.length && current.every((id, i) => id === fallback[i])
-  }, [rotators, data.people, data.teams])
+  /** 机动 / 候补池（顺序即顶岗优先级） */
+  const standbyList = useMemo(() => ringStandby(data), [data])
+
+  /** 轮转环每个位次在真实表格里的标签：101（复印）→ 102（受理）→ … → 填表 */
+  const ringSlotLabels = useMemo(() => {
+    const labels: string[] = []
+    for (const post of data.posts) {
+      if (!post.ringSlot) continue
+      for (let i = 0; i < post.capacity; i++) {
+        labels.push(post.slotHints?.[i] ?? `${post.name}${post.capacity > 1 ? ` ${i + 1}` : ''}`)
+      }
+    }
+    return labels
+  }, [data.posts])
+
+  /** 当前轮转环是否已经等于默认基准（用于禁用「恢复默认」） */
+  const ringIsDefault = useMemo(() => {
+    const fallback = defaultRing(data.people)
+    const sameMembers =
+      ringList.length === fallback.members.length &&
+      ringList.every((p, i) => p.id === fallback.members[i])
+    const sameStandby =
+      standbyList.length === fallback.standby.length &&
+      standbyList.every((p, i) => p.id === fallback.standby[i])
+    return sameMembers && sameStandby
+  }, [ringList, standbyList, data.people])
 
   const teamOptions = useMemo(
     () =>
@@ -404,37 +427,45 @@ export default function PeopleView({ data, setData }: Props) {
     }))
   }
 
-  /** 平日轮转顺序：把某人拖到指定序号 */
-  function moveWeekdayMember(personId: string, targetIndex: number) {
+  /** 轮转环：把某人拖到指定区（ring = 环内，standby = 机动池）的指定序号 */
+  function moveRingMember(personId: string, zone: 'ring' | 'standby', targetIndex: number) {
     setData((prev) => {
-      const ids = rotationPool(prev).map((p) => p.id)
-      const from = ids.indexOf(personId)
-      if (from < 0) return prev
-      const rest = ids.filter((id) => id !== personId)
-      const to = Math.max(0, Math.min(targetIndex, rest.length))
-      rest.splice(to, 0, personId)
-      return { ...prev, weekdayOrder: rest }
+      const members = [...(prev.ring?.members ?? [])]
+      const standby = [...(prev.ring?.standby ?? [])]
+      const inMembers = members.indexOf(personId)
+      const inStandby = standby.indexOf(personId)
+      if (inMembers < 0 && inStandby < 0) return prev
+
+      if (inMembers >= 0) members.splice(inMembers, 1)
+      if (inStandby >= 0) standby.splice(inStandby, 1)
+
+      const list = zone === 'ring' ? members : standby
+      const to = Math.max(0, Math.min(targetIndex, list.length))
+      list.splice(to, 0, personId)
+
+      return { ...prev, ring: { ...prev.ring, members, standby } }
     })
   }
 
-  /** 平日轮转顺序：上下移动一位 */
-  function moveWeekdayMemberBy(personId: string, delta: number) {
+  /** 轮转环：上下移动一位 */
+  function moveRingMemberBy(personId: string, zone: 'ring' | 'standby', delta: number) {
     setData((prev) => {
-      const ids = rotationPool(prev).map((p) => p.id)
-      const from = ids.indexOf(personId)
+      const members = [...(prev.ring?.members ?? [])]
+      const standby = [...(prev.ring?.standby ?? [])]
+      const list = zone === 'ring' ? members : standby
+      const from = list.indexOf(personId)
       const target = from + delta
-      if (from < 0 || target < 0 || target >= ids.length) return prev
-      const next = [...ids]
-      const [moved] = next.splice(from, 1)
-      next.splice(target, 0, moved)
-      return { ...prev, weekdayOrder: next }
+      if (from < 0 || target < 0 || target >= list.length) return prev
+      const [moved] = list.splice(from, 1)
+      list.splice(target, 0, moved)
+      return { ...prev, ring: { ...prev.ring, members, standby } }
     })
   }
 
-  /** 恢复默认平日顺序：按 A 组在前、B 组在后的班组顺序还原 */
-  function resetWeekdayOrder() {
-    setData((prev) => ({ ...prev, weekdayOrder: defaultWeekdayOrder(prev.people, prev.teams) }))
-    setToast({ kind: 'ok', title: '已恢复默认', text: '平日轮转顺序按班组顺序还原' })
+  /** 恢复默认轮转环：按真实班表 2026-11-30 那一周的基准搭配还原 */
+  function resetRing() {
+    setData((prev) => ({ ...prev, ring: defaultRing(prev.people) }))
+    setToast({ kind: 'ok', title: '已恢复默认', text: '轮转环按真实班表 2026-11-30 的基准搭配还原' })
   }
 
   /* ------------------------------------------------------------ 拖拽排序 */
@@ -457,10 +488,15 @@ export default function PeopleView({ data, setData }: Props) {
     setOverKey(null)
   }
 
-  /** 落点是否接受当前拖拽：平日只能进平日，班组只能在同一个组内 */
-  function canDrop(kind: string, teamId: TeamId | null, drag: DragSource | null): boolean {
+  /** 落点是否接受当前拖拽：轮转环与机动池可以互拖，班组只能在同一个组内 */
+  function canDrop(
+    kind: string,
+    zone: 'ring' | 'standby',
+    teamId: TeamId | null,
+    drag: DragSource | null,
+  ): boolean {
     if (!drag) return false
-    if (kind === 'weekday') return drag.kind === 'weekday'
+    if (kind === 'ring' || kind === 'standby') return drag.kind === 'ring'
     if (kind === 'team') return drag.kind === 'team' && drag.teamId === teamId
     return false
   }
@@ -471,13 +507,14 @@ export default function PeopleView({ data, setData }: Props) {
     const kind = target.getAttribute('data-drop') ?? ''
     const team = target.getAttribute('data-team')
     const teamId: TeamId | null = team === 'A' || team === 'B' ? team : null
-    if (!canDrop(kind, teamId, dragRef.current)) {
+    const zone: 'ring' | 'standby' = target.getAttribute('data-zone') === 'standby' ? 'standby' : 'ring'
+    if (!canDrop(kind, zone, teamId, dragRef.current)) {
       setOverKey(null)
       return
     }
     event.preventDefault()
     event.dataTransfer.dropEffect = 'move'
-    const key = `${kind}:${teamId ?? ''}:${target.getAttribute('data-index') ?? ''}`
+    const key = `${kind}:${zone}:${teamId ?? ''}:${target.getAttribute('data-index') ?? ''}`
     if (key !== overKey) setOverKey(key)
   }
 
@@ -491,14 +528,15 @@ export default function PeopleView({ data, setData }: Props) {
     const kind = target.getAttribute('data-drop') ?? ''
     const team = target.getAttribute('data-team')
     const teamId: TeamId | null = team === 'A' || team === 'B' ? team : null
-    if (!canDrop(kind, teamId, drag)) return
+    const zone: 'ring' | 'standby' = target.getAttribute('data-zone') === 'standby' ? 'standby' : 'ring'
+    if (!canDrop(kind, zone, teamId, drag)) return
 
     const rawIndex = target.getAttribute('data-index')
     const index = rawIndex === null ? -1 : Number.parseInt(rawIndex, 10)
     if (!Number.isFinite(index) || index < 0) return
 
-    if (kind === 'weekday' && drag.kind === 'weekday') {
-      moveWeekdayMember(drag.personId, index)
+    if ((kind === 'ring' || kind === 'standby') && drag.kind === 'ring') {
+      moveRingMember(drag.personId, zone, index)
       return
     }
     if (kind === 'team' && drag.kind === 'team' && teamId) {
@@ -785,13 +823,32 @@ export default function PeopleView({ data, setData }: Props) {
           <select
             className="input"
             value={person.fixedPostId ?? ''}
-            title="固定岗：除本岗外不可调岗；照相岗缺人时全员可顶"
+            title="固定岗：除本岗外不可调岗；照相岗缺人时全员可顶。轮转位次由轮转环决定，不可设为固定岗"
             onChange={(e) => updatePerson(person.id, { fixedPostId: e.target.value || null })}
           >
             <option value="">不固定</option>
-            {data.posts.map((post) => (
-              <option key={post.id} value={post.id}>
-                {post.name}
+            {data.posts
+              .filter((post) => !post.ringSlot)
+              .map((post) => (
+                <option key={post.id} value={post.id}>
+                  {post.name}
+                </option>
+              ))}
+          </select>
+        </td>
+        <td>
+          <select
+            className="input"
+            value={person.restWeekday === null || person.restWeekday === undefined ? '' : String(person.restWeekday)}
+            title="每周固定轮休日：当天不上岗，其位次由机动顶上"
+            onChange={(e) =>
+              updatePerson(person.id, { restWeekday: e.target.value === '' ? null : Number(e.target.value) })
+            }
+          >
+            <option value="">不轮休</option>
+            {REST_WEEKDAYS.map((label, index) => (
+              <option key={label} value={index}>
+                {label}
               </option>
             ))}
           </select>
@@ -880,6 +937,7 @@ export default function PeopleView({ data, setData }: Props) {
                   <th style={{ width: 100 }}>值班班组</th>
                   <th style={{ width: 118 }}>组长范围</th>
                   <th style={{ width: 140 }}>固定岗位</th>
+                  <th style={{ width: 104 }}>轮休日</th>
                   <th style={{ width: 92 }}>状态</th>
                   <th style={{ width: 60 }}>操作</th>
                 </tr>
@@ -904,6 +962,7 @@ export default function PeopleView({ data, setData }: Props) {
                   <th style={{ width: 100 }}>值班班组</th>
                   <th style={{ width: 118 }}>组长范围</th>
                   <th style={{ width: 140 }}>固定岗位</th>
+                  <th style={{ width: 104 }}>轮休日</th>
                   <th style={{ width: 92 }}>状态</th>
                   <th style={{ width: 60 }}>操作</th>
                 </tr>
@@ -922,32 +981,105 @@ export default function PeopleView({ data, setData }: Props) {
       <div className="panel" style={{ marginBottom: 14 }}>
         <h2>
           <RotateIcon />
-          平日轮转顺序
-          <span className="rt">工作日「一号台 → 校对 → 扫描 → 机动」每周整体顺移一位</span>
+          平日轮转环
+          <span className="rt">7 个位次（101 → 102 → 103 → 104 → 105 → 106 → 填表）每周整体右移一位</span>
         </h2>
         <div className="panel-body">
           <div className="row" style={{ marginBottom: 10 }}>
             <button
               className="btn sm"
-              title="按 A 组在前、B 组在后的班组顺序还原"
-              disabled={weekdayOrderIsDefault}
-              onClick={resetWeekdayOrder}
+              title="按真实班表 2026-11-30 那一周的基准搭配还原"
+              disabled={ringIsDefault}
+              onClick={resetRing}
             >
               <ResetIcon />
               恢复默认
             </button>
             <span className="note" style={{ marginTop: 0 }}>
-              拖动姓名前的把手可调整顺序，也可用 ↑ ↓ 按钮微调。
+              基准周 <b>{data.ring?.anchorDate}</b>；往后每一周整体右移一位 —— 101 位由机动池队首补入，填表位的人离环回到池尾。
+              拖动姓名前的把手可调整顺序，也可用 ↑ ↓ 按钮微调，两个区之间可以互拖。
             </span>
           </div>
 
           <div className="grp-hd">
             <i />
-            轮转池
-            <span className="cnt">{rotators.length} 人 · 大厅主班池中无固定岗者</span>
+            轮转环
+            <span className="cnt">{ringList.length} 人 · 位次 101 ~ 填表</span>
           </div>
-          {rotators.length === 0 ? (
-            <div className="empty">还没有轮转池人员：大厅主班池中「没有固定岗」的人会进入轮转池。</div>
+          {ringList.length === 0 ? (
+            <div className="empty">还没有轮转环成员：大厅主班池里的人会自动补进来。</div>
+          ) : (
+            <table className="tbl">
+              <thead>
+                <tr>
+                  <th style={{ width: 44 }}>序</th>
+                  <th style={{ width: 128 }}>位次</th>
+                  <th>姓名</th>
+                  <th style={{ width: 120 }}>操作</th>
+                </tr>
+              </thead>
+              <tbody>
+                {ringList.map((person, index) => (
+                  <tr
+                    key={person.id}
+                    className={`drag-row${overKey === `ring:ring::${index}` ? ' drag-over' : ''}`}
+                    draggable
+                    data-drop="ring"
+                    data-zone="ring"
+                    data-index={index}
+                    onDragStart={(e) => onDragStart(e, { kind: 'ring', zone: 'ring', personId: person.id })}
+                    onDragEnd={onDragEnd}
+                    onDragOver={onDragOver}
+                    onDragLeave={onDragLeave}
+                    onDrop={onDrop}
+                  >
+                    <td className="num">{index + 1}</td>
+                    <td>{ringSlotLabels[index] ?? '—'}</td>
+                    <td>
+                      <div className="row" style={{ gap: 6, flexWrap: 'nowrap' }}>
+                        <span className="drag-handle" aria-hidden="true">
+                          <GripIcon />
+                        </span>
+                        <span>{person.name}</span>
+                        {person.teamId ? <span className="chip">{person.teamId}组</span> : null}
+                        {person.canLead ? <span className="chip lead">组长</span> : null}
+                      </div>
+                    </td>
+                    <td>
+                      <div className="row" style={{ gap: 4, flexWrap: 'nowrap' }}>
+                        <button
+                          className="btn sm ghost"
+                          title="上移"
+                          draggable={false}
+                          disabled={index === 0}
+                          onClick={() => moveRingMemberBy(person.id, 'ring', -1)}
+                        >
+                          <UpIcon />
+                        </button>
+                        <button
+                          className="btn sm ghost"
+                          title="下移"
+                          draggable={false}
+                          disabled={index === ringList.length - 1}
+                          onClick={() => moveRingMemberBy(person.id, 'ring', 1)}
+                        >
+                          <DownIcon />
+                        </button>
+                      </div>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          )}
+
+          <div className="grp-hd" style={{ marginTop: 12 }}>
+            <i />
+            机动 / 候补池
+            <span className="cnt">{standbyList.length} 人 · 队首优先顶岗</span>
+          </div>
+          {standbyList.length === 0 ? (
+            <div className="empty">机动池为空：环上有人休假时就没有人顶岗了。</div>
           ) : (
             <table className="tbl">
               <thead>
@@ -958,14 +1090,15 @@ export default function PeopleView({ data, setData }: Props) {
                 </tr>
               </thead>
               <tbody>
-                {rotators.map((person, index) => (
+                {standbyList.map((person, index) => (
                   <tr
                     key={person.id}
-                    className={`drag-row${overKey === `weekday::${index}` ? ' drag-over' : ''}`}
+                    className={`drag-row${overKey === `standby:standby::${index}` ? ' drag-over' : ''}`}
                     draggable
-                    data-drop="weekday"
+                    data-drop="standby"
+                    data-zone="standby"
                     data-index={index}
-                    onDragStart={(e) => onDragStart(e, { kind: 'weekday', personId: person.id })}
+                    onDragStart={(e) => onDragStart(e, { kind: 'ring', zone: 'standby', personId: person.id })}
                     onDragEnd={onDragEnd}
                     onDragOver={onDragOver}
                     onDragLeave={onDragLeave}
@@ -989,7 +1122,7 @@ export default function PeopleView({ data, setData }: Props) {
                           title="上移"
                           draggable={false}
                           disabled={index === 0}
-                          onClick={() => moveWeekdayMemberBy(person.id, -1)}
+                          onClick={() => moveRingMemberBy(person.id, 'standby', -1)}
                         >
                           <UpIcon />
                         </button>
@@ -997,8 +1130,8 @@ export default function PeopleView({ data, setData }: Props) {
                           className="btn sm ghost"
                           title="下移"
                           draggable={false}
-                          disabled={index === rotators.length - 1}
-                          onClick={() => moveWeekdayMemberBy(person.id, 1)}
+                          disabled={index === standbyList.length - 1}
+                          onClick={() => moveRingMemberBy(person.id, 'standby', 1)}
                         >
                           <DownIcon />
                         </button>
@@ -1011,9 +1144,8 @@ export default function PeopleView({ data, setData }: Props) {
           )}
 
           <p className="note">
-            这个顺序决定工作日「一号台 → 校对 → 扫描 → 机动」的每周整体顺移：第 1 位先上一号台，其余依次校对、扫描、机动，下周整体顺移一位。
-            它与 A/B 值班班组名单相互独立 —— 调整 A/B 组的成员或组内顺序，都不会打乱这里的轮转顺序。
-            轮转池 = 大厅主班池中「没有固定岗」的人（有固定岗的人不参与平日轮转）。
+            环 = 真实班表里每周整体右移一位的 7 个轮转位次；机动池 = 环外的大厅主班人员，负责顶休假缺岗、做 107 边境证、其余待命
+            （对应真实班表的「816 顶班待命」行）。它与 A/B 值班班组名单相互独立 —— 调整 A/B 组的成员或组内顺序，都不会打乱这里的轮转环。
           </p>
         </div>
       </div>
@@ -1171,7 +1303,7 @@ export default function PeopleView({ data, setData }: Props) {
               <div className="grp-hd">
                 <i />
                 大厅组长
-                <span className="cnt">{hallLeaders.length} 人 · 按下列顺序逐日轮值</span>
+                <span className="cnt">{hallLeaders.length} 人 · 按下列顺序一周一人轮值</span>
               </div>
               {hallLeaders.length === 0 ? (
                 <div className="empty">还没有大厅组长。</div>
@@ -1319,7 +1451,7 @@ export default function PeopleView({ data, setData }: Props) {
           </div>
 
           <p className="note">
-            大厅组长管辖除 512 以外的所有岗位，按上表顺序逐日轮值；512 柜台组长只负责 512 柜台。组长是职务标签，不是独立岗位：
+            大厅组长管辖除 512 以外的所有岗位，按上表顺序一周一人轮值，当天本人不在岗时由下一位在岗的组长代班；512 柜台组长只负责 512 柜台。组长是职务标签，不是独立岗位：
             组长当天通常兼一个具体位次。
           </p>
         </div>

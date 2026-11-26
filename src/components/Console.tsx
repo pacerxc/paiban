@@ -385,7 +385,7 @@ export default function Console({ data, weekStart, setData, notify }: Props) {
   const hasDebt = debtCount > 0 || shortRestCount > 0
 
   const weekTotal = hallPosts
-    .filter((p) => p.flexMode !== 'leftover')
+    .filter((p) => p.flexMode !== 'leftover' && !p.optional)
     .reduce((sum, p) => sum + p.capacity, 0)
   const flexMax = flexPost?.capacity ?? 0
   const satTotal = hallPosts.reduce((sum, p) => sum + p.saturdayCapacity, 0)
@@ -405,6 +405,7 @@ export default function Console({ data, weekStart, setData, notify }: Props) {
             {post.name}
           </div>
           <div className="c">
+            {post.hint ? `${post.hint} · ` : ''}
             {isCounter
               ? `${post.capacity}人 · 周六无此岗`
               : `${post.capacity}人 · 周六${post.saturdayCapacity}`}
@@ -586,7 +587,7 @@ export default function Console({ data, weekStart, setData, notify }: Props) {
 
         <div className="pad" style={{ paddingTop: 13 }}>
           <div className="note" style={{ marginTop: 0 }}>
-            组长是职务标签，不是独立岗位。大厅组长按 王玉花 → 杨娟 → 汪甜 逐日轮值；
+            组长是职务标签，不是独立岗位。大厅组长按 王玉花 → 杨娟 → 汪甜 一周一人轮值，当天不在岗由下一位代班；
             艾丽娜只负责 512 柜台。
           </div>
         </div>
