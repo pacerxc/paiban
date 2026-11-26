@@ -6,16 +6,18 @@ import Console from './components/Console'
 import MonthBoard from './components/MonthBoard'
 import PeopleView from './components/PeopleView'
 import LedgerView from './components/LedgerView'
+import StatsView from './components/StatsView'
 import ExportView from './components/ExportView'
 
 type Theme = 'warm' | 'ocean' | 'dark'
-type TabId = 'board' | 'month' | 'people' | 'ledger' | 'export'
+type TabId = 'board' | 'month' | 'people' | 'ledger' | 'stats' | 'export'
 
 const TABS: Array<{ id: TabId; label: string }> = [
   { id: 'board', label: '班表' },
   { id: 'month', label: '月表' },
   { id: 'people', label: '人员' },
   { id: 'ledger', label: '台账' },
+  { id: 'stats', label: '统计' },
   { id: 'export', label: '导出' },
 ]
 
@@ -143,7 +145,7 @@ export default function App() {
           <path d="M5 9l-3 3 3 3M9 5l3-3 3 3M15 19l-3 3-3-3M19 9l3 3-3 3M2 12h20M12 2v20" />
         </svg>
         拖动<b>班表里的姓名</b>可换岗；从左栏<b>人员树</b>拖人进格子＝安排上班；拖到下方<b>不在岗</b>＝当天休息。带{' '}
-        <b>★</b> 的是值班组长。
+        <b>★</b> 的是值班组长。表格下方会实时列出<b>违反的规则</b>，照着改完再点<b>锁定本周</b>保存。
       </p>
 
       {storageError && (
@@ -167,6 +169,9 @@ export default function App() {
       {tab === 'ledger' && (
         <LedgerView data={data} setData={setData} month={month} onMonthChange={setMonth} />
       )}
+      {tab === 'stats' && (
+        <StatsView data={data} month={month} onMonthChange={setMonth} />
+      )}
       {tab === 'export' && (
         <ExportView
           data={data}
@@ -179,7 +184,7 @@ export default function App() {
 
       <div className="foot">
         <span>
-          <b>数据</b>　保存在本机浏览器（paiban.data.v4），建议定期在「导出」页备份。
+          <b>数据</b>　保存在本机浏览器（paiban.data.v5），建议定期在「导出」页备份。
         </span>
         <span>
           <b>岗位配置</b>　工作日 一号台1 受理2 校对2 扫描1 照相1 填表1 机动0~3；周六/假日 一号台2 填表2 受理3 照相1（无校对、扫描、机动）。
@@ -189,6 +194,12 @@ export default function App() {
         </span>
         <span>
           <b>值班组</b>　A、B 两组隔周交替，周六与法定假日整组上岗 8 人；B 组少 1 人，按 A 组名单顺序一人一次轮借。
+        </span>
+        <span>
+          <b>平日顺序</b>　工作日「一号台 → 校对 → 扫描 → 机动」按平日轮转顺序每周整体顺移一位，可在「人员」页拖拽调整。
+        </span>
+        <span>
+          <b>规则校验</b>　班表下方实时列出违反的规则（固定岗、512 柜台、在岗人数、组长位次等），只提示不拦截。
         </span>
       </div>
 

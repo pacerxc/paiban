@@ -2,8 +2,9 @@ import { useMemo, useRef, useState } from 'react'
 import type { Dispatch, SetStateAction, DragEvent } from 'react'
 import type { AppData } from '../types'
 import { addDays, parseISO, weekdayLabel } from '../lib/date'
-import { buildAlerts, planDay, planRange } from '../lib/scheduler'
+import { buildAlerts, checkPersonPost, planDay, planRange } from '../lib/scheduler'
 import type { DayPlan } from '../lib/scheduler'
+import { checkRules } from '../lib/rules'
 import { buildLedger } from '../lib/leave'
 
 interface Props {
@@ -85,6 +86,8 @@ export default function Console({ data, weekStart, setData, notify }: Props) {
 
   const hallPosts = data.posts.filter((p) => !p.separate)
   const counterPosts = data.posts.filter((p) => p.separate)
+  /** 机动岗：浮动岗，位次按当天剩余人数，单独标出免得混进「最少在岗」基数 */
+  const flexPost = data.posts.find((p) => p.flexMode === 'leftover')
 
   /* ------------------------------------------------------------ 槽位 */
 
@@ -203,6 +206,16 @@ export default function Console({ data, weekStart, setData, notify }: Props) {
     return displaced
   }
 
+  /**
+   * 软校验：排班规则冲突时只提示、不拦截。
+   * 返回违反的规则文案，null 表示这条安排没问题。
+   */
+  function softCheck(date: string, personId: string, postId: string): string | null {
+    const check = checkPersonPost(data, personId, postId, date)
+    if (check.ok) return null
+    return `${check.text}　${check.rule}`
+  }
+
   function dropToCell(date: string, postId: string, slot: number | null, drag: DragState) {
     const source = drag.source
     if (
@@ -229,12 +242,19 @@ export default function Console({ data, weekStart, setData, notify }: Props) {
       return
     }
 
+    // 软校验：先看会不会违反岗位规则，违反也照排，只在提示里说明
+    const warnings: string[] = []
+    const own = softCheck(date, drag.personId, postId)
+    if (own) warnings.push(own)
+
     const dayPlans = { ...data.dayPlans }
     const day = materialize(date)
     const displaced = placeInto(day, date, postId, slot, drag.personId)
 
     if (displaced && displaced !== drag.personId) {
       if (source.type === 'cell') {
+        const other = softCheck(date, displaced, source.postId)
+        if (other) warnings.push(other)
         const srcDay = source.date === date ? day : materialize(source.date)
         if (source.date !== date) {
           for (const post of data.posts) {
@@ -257,15 +277,17 @@ export default function Console({ data, weekStart, setData, notify }: Props) {
         if (source.date !== date) dayPlans[source.date] = srcDay
       }
       notify(
-        'ok',
+        warnings.length > 0 ? 'err' : 'ok',
         `${personById.get(drag.personId)?.name ?? ''} 已调岗`,
-        `${personById.get(displaced)?.name ?? ''} 换到「${postById.get(postId)?.name ?? ''}」的来源位次`,
+        warnings.length > 0
+          ? `违反规则：${warnings.join('　')}`
+          : `${personById.get(displaced)?.name ?? ''} 换到「${postById.get(postId)?.name ?? ''}」的来源位次`,
       )
     } else {
       notify(
-        'ok',
+        warnings.length > 0 ? 'err' : 'ok',
         `${personById.get(drag.personId)?.name ?? ''} 已安排到「${postById.get(postId)?.name ?? ''}」`,
-        shortDate(date),
+        warnings.length > 0 ? `违反规则：${warnings.join('　')}` : shortDate(date),
       )
     }
 
@@ -314,6 +336,12 @@ export default function Console({ data, weekStart, setData, notify }: Props) {
 
   const alerts = useMemo(() => buildAlerts(data, dates), [data, dates])
 
+  /** 本周规则校验：拖动后实时重算，表格下方列出每一处违反的规则 */
+  const violations = useMemo(() => checkRules(data, dates), [data, dates])
+  const ruleErrors = violations.filter((v) => v.level === 'error').length
+  const ruleWarns = violations.length - ruleErrors
+  const adjustedDays = dates.filter((date) => data.dayPlans[date]).length
+
   const restStat = useMemo(() => {
     const quota = data.settings.restQuotaDays
     const rows = mains.map((p) => {
@@ -356,7 +384,10 @@ export default function Console({ data, weekStart, setData, notify }: Props) {
   const shortRestCount = restStat.filter((r) => r.value < data.settings.restQuotaDays).length
   const hasDebt = debtCount > 0 || shortRestCount > 0
 
-  const weekTotal = hallPosts.reduce((sum, p) => sum + p.capacity, 0)
+  const weekTotal = hallPosts
+    .filter((p) => p.flexMode !== 'leftover')
+    .reduce((sum, p) => sum + p.capacity, 0)
+  const flexMax = flexPost?.capacity ?? 0
   const satTotal = hallPosts.reduce((sum, p) => sum + p.saturdayCapacity, 0)
   const counterTotal = counterPosts.reduce((sum, p) => sum + p.capacity, 0)
 
@@ -389,7 +420,7 @@ export default function Console({ data, weekStart, setData, notify }: Props) {
             )
           }
           const slots = slotsOf(date, post.id, plan)
-          const low = !isCounter && plan.onDuty < data.settings.minDailyHeadcount
+          const low = !isCounter && plan.coreOnDuty < data.settings.minDailyHeadcount
           const cls = [
             plan.type === 'duty' ? 'col-sat' : '',
             low ? 'col-low' : '',
@@ -576,7 +607,7 @@ export default function Console({ data, weekStart, setData, notify }: Props) {
             周
           </h1>
           <span className="sub">
-            工作日 {weekTotal} 位次 · 周六 {satTotal} 位次 · 512 柜台 {counterTotal} 人 · 周日公休 · 最少在岗{' '}
+            工作日 {weekTotal} 位次 + 机动 0~{flexMax} · 周六 {satTotal} 位次 · 512 柜台 {counterTotal} 人 · 周日公休 · 最少在岗{' '}
             {data.settings.minDailyHeadcount} 人
           </span>
           <div className="rt">
@@ -629,14 +660,22 @@ export default function Console({ data, weekStart, setData, notify }: Props) {
               <th style={{ width: 104 }}>岗位</th>
               {dates.map((date) => {
                 const plan = plans.get(date)!
-                const low = plan.working && plan.onDuty < data.settings.minDailyHeadcount
+                const low = plan.working && plan.coreOnDuty < data.settings.minDailyHeadcount
                 const cls = !plan.working ? 'off' : plan.type === 'duty' ? 'sat' : ''
+                const flexCount = flexPost ? (plan.byPost.get(flexPost.id)?.length ?? 0) : 0
                 return (
                   <th key={date} className={`${cls}${low ? ' low' : ''}`}>
                     <span className="dow">{weekdayLabel(date)}</span>
                     <span className="md">{shortDate(date)}</span>
                     <span className="c">
-                      {plan.working ? `${plan.onDuty}/${plan.capacity}` : '公休'}
+                      {plan.working ? (
+                        <>
+                          {plan.coreOnDuty}/{plan.coreCapacity}
+                          {flexCount > 0 ? <em className="fx">机动 {flexCount}</em> : null}
+                        </>
+                      ) : (
+                        '公休'
+                      )}
                     </span>
                   </th>
                 )
@@ -657,6 +696,42 @@ export default function Console({ data, weekStart, setData, notify }: Props) {
             </>
           )}
         </table>
+
+        {/* -------------------------------------- 表格下方：规则校验提示 */}
+        <div className={`rulebox${violations.length > 0 ? ' has' : ''}`}>
+          <div className="rulebox-hd">
+            <Icon d={ICON.warn} />
+            规则校验
+            <span className="rt">
+              {violations.length === 0
+                ? '本周排班符合全部规则'
+                : `${ruleErrors} 条违反 · ${ruleWarns} 条提醒`}
+            </span>
+          </div>
+          {violations.length === 0 ? (
+            <div className="rulebox-ok">
+              没有发现违反规则的情况。拖动调整后这里会实时列出问题所在，确认后再「锁定本周」保存。
+            </div>
+          ) : (
+            <ul className="rulelist">
+              {violations.map((v, index) => (
+                <li key={`${v.date}-${v.personId ?? ''}-${v.postId ?? ''}-${index}`} className={`vrow ${v.level}`}>
+                  <span className="ic">
+                    <Icon d={v.level === 'error' ? ICON.alarm : ICON.warn} size={11} />
+                  </span>
+                  <span className="tx">
+                    <b>{v.title}</b>
+                    <span>{v.rule}</span>
+                    <span className="fx">建议：{v.fix}</span>
+                  </span>
+                </li>
+              ))}
+            </ul>
+          )}
+          <div className="rulebox-ft">
+            本周已手工调整 {adjustedDays} 天；未锁定前调整会随顺序变化重排，锁定后固定下来。
+          </div>
+        </div>
 
         <div className="strip">
           <div className="strip-hd">

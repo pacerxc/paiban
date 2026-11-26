@@ -503,6 +503,14 @@ table.grid thead th .c {
   margin-top: 2px;
 }
 
+table.grid thead th .c .fx {
+  font-style: normal;
+  font-family: inherit;
+  font-size: 9.5px;
+  opacity: 0.75;
+  margin-left: 4px;
+}
+
 table.grid thead th.low .c {
   color: #ff9d8f;
   font-weight: 600;
@@ -781,6 +789,156 @@ body[data-theme='dark'] .leaderbar {
 .rbox .pc sup {
   font-size: 9px;
   opacity: 0.7;
+}
+
+/* ------------------------------------------------------ 规则校验（表格下方） */
+
+.rulebox {
+  border-top: 1px solid var(--line-2);
+  border-bottom: 1px solid var(--line-2);
+  background: color-mix(in srgb, var(--card) 97%, var(--ink) 3%);
+}
+
+.rulebox.has {
+  background: color-mix(in srgb, var(--err-soft) 55%, var(--card));
+}
+
+.rulebox-hd {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 10px 15px 7px;
+  font-size: 11.5px;
+  font-weight: 600;
+  color: var(--ink-2);
+}
+
+.rulebox-hd svg {
+  width: 13px;
+  height: 13px;
+  color: var(--accent);
+  flex: none;
+}
+
+.rulebox-hd .rt {
+  margin-left: auto;
+  font-weight: 400;
+  font-size: 10.5px;
+  color: var(--ink-3);
+  white-space: nowrap;
+}
+
+.rulebox-ok {
+  padding: 2px 15px 10px;
+  font-size: 11.5px;
+  color: var(--ink-3);
+  line-height: 1.6;
+}
+
+.rulelist {
+  list-style: none;
+  margin: 0;
+  padding: 0 15px 4px;
+}
+
+.vrow {
+  display: flex;
+  gap: 9px;
+  padding: 7px 0;
+  border-bottom: 1px solid var(--line-2);
+  font-size: 12px;
+  line-height: 1.55;
+}
+
+.vrow:last-child {
+  border-bottom: 0;
+}
+
+.vrow .ic {
+  width: 17px;
+  height: 17px;
+  flex: none;
+  border-radius: 5px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  margin-top: 1px;
+  background: #e9eae7;
+  color: var(--ink-2);
+}
+
+body[data-theme='dark'] .vrow .ic {
+  background: #2a2e34;
+}
+
+.vrow.error .ic {
+  background: var(--err);
+  color: #fff;
+}
+
+.vrow.warn .ic {
+  background: var(--accent);
+  color: #241a05;
+}
+
+.vrow .tx b {
+  display: block;
+  font-weight: 600;
+  margin-bottom: 1px;
+}
+
+.vrow.error .tx b {
+  color: var(--err);
+}
+
+.vrow.warn .tx b {
+  color: var(--accent);
+}
+
+.vrow .tx span {
+  display: block;
+  color: var(--ink-3);
+}
+
+.vrow .tx .fx {
+  color: var(--ink-2);
+  margin-top: 1px;
+}
+
+.rulebox-ft {
+  padding: 8px 15px 11px;
+  font-size: 10.5px;
+  color: var(--ink-3);
+  line-height: 1.5;
+}
+
+/* --------------------------------------------------- 可拖拽排序（人员页） */
+
+.drag-row {
+  cursor: grab;
+  user-select: none;
+}
+
+.drag-row.dragging {
+  opacity: 0.4;
+}
+
+.drag-over {
+  background: var(--accent-soft) !important;
+  box-shadow: inset 0 0 0 2px var(--accent-line);
+}
+
+.drag-handle {
+  display: inline-flex;
+  align-items: center;
+  flex: none;
+  color: var(--ink-3);
+  cursor: grab;
+}
+
+.drag-handle svg {
+  width: 13px;
+  height: 13px;
 }
 
 /* ------------------------------------------------------------ 告警 */
@@ -1141,6 +1299,11 @@ textarea.input {
 
 .tbl tbody tr:hover {
   background: color-mix(in srgb, var(--accent-soft) 40%, transparent);
+}
+
+.tbl td.stat-detail {
+  padding: 0;
+  background: color-mix(in srgb, var(--card) 96%, var(--ink) 4%);
 }
 
 .tbl .num {

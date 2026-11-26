@@ -1,7 +1,8 @@
-import { useEffect, useMemo, useState } from 'react'
-import type { Dispatch, SetStateAction } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
+import type { Dispatch, DragEvent, SetStateAction } from 'react'
 import type { AppData, LeaderScope, Person, Pool, Team, TeamId } from '../types'
-import { POST_COLORS, uid } from '../lib/store'
+import { POST_COLORS, defaultWeekdayOrder, uid } from '../lib/store'
+import { rotationPool } from '../lib/scheduler'
 
 interface Props {
   data: AppData
@@ -20,6 +21,15 @@ interface ToastState {
   title: string
   text?: string
 }
+
+/**
+ * 拖拽来源。
+ * - weekday：平日轮转顺序里的某个人
+ * - team：值班班组组内排序的某个人（只能在同一个组内拖）
+ */
+type DragSource =
+  | { kind: 'weekday'; personId: string }
+  | { kind: 'team'; teamId: TeamId; personId: string }
 
 const TEAM_IDS: TeamId[] = ['A', 'B']
 
@@ -184,6 +194,34 @@ function AlertIcon() {
   )
 }
 
+function RotateIcon() {
+  return (
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round" strokeLinejoin="round">
+      <path d="M17 1l4 4-4 4" />
+      <path d="M3 11V9a4 4 0 0 1 4-4h14" />
+      <path d="M7 23l-4-4 4-4" />
+      <path d="M21 13v2a4 4 0 0 1-4 4H3" />
+    </svg>
+  )
+}
+
+function GripIcon() {
+  return (
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round" strokeLinejoin="round">
+      <path d="M9 5h.01M9 12h.01M9 19h.01M15 5h.01M15 12h.01M15 19h.01" />
+    </svg>
+  )
+}
+
+function ResetIcon() {
+  return (
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round" strokeLinejoin="round">
+      <path d="M3 7v6h6" />
+      <path d="M3.5 13a9 9 0 1 0 2.1-6.4L3 9" />
+    </svg>
+  )
+}
+
 function toInt(value: string, fallback: number): number {
   const n = Number.parseInt(value, 10)
   return Number.isFinite(n) ? n : fallback
@@ -192,6 +230,9 @@ function toInt(value: string, fallback: number): number {
 export default function PeopleView({ data, setData }: Props) {
   const [confirm, setConfirm] = useState<ConfirmState | null>(null)
   const [toast, setToast] = useState<ToastState | null>(null)
+  /** 当前被拖过的行（用于高亮放置位置） */
+  const [overKey, setOverKey] = useState<string | null>(null)
+  const dragRef = useRef<DragSource | null>(null)
 
   const [newName, setNewName] = useState('')
   const [newPool, setNewPool] = useState<Pool>('main')
@@ -226,6 +267,16 @@ export default function PeopleView({ data, setData }: Props) {
         .sort((a, b) => (a.leaderOrder ?? a.order) - (b.leaderOrder ?? b.order)),
     [people],
   )
+
+  /** 工作日轮转池（大厅主班池中无固定岗的人），顺序 = data.weekdayOrder */
+  const rotators = useMemo(() => rotationPool(data), [data.people, data.weekdayOrder])
+
+  /** 当前平日顺序是否已经等于默认值（用于禁用「恢复默认」） */
+  const weekdayOrderIsDefault = useMemo(() => {
+    const current = rotators.map((p) => p.id)
+    const fallback = defaultWeekdayOrder(data.people, data.teams)
+    return current.length === fallback.length && current.every((id, i) => id === fallback[i])
+  }, [rotators, data.people, data.teams])
 
   const teamOptions = useMemo(
     () =>
@@ -335,6 +386,124 @@ export default function PeopleView({ data, setData }: Props) {
         return { ...t, memberIds: ids }
       }),
     }))
+  }
+
+  /** 班组组内排序：把某人拖到指定序号（只能在同一个组内） */
+  function moveTeamMemberTo(teamId: TeamId, personId: string, targetIndex: number) {
+    setData((prev) => ({
+      ...prev,
+      teams: prev.teams.map((t) => {
+        if (t.id !== teamId) return t
+        const from = t.memberIds.indexOf(personId)
+        if (from < 0) return t
+        const rest = t.memberIds.filter((id) => id !== personId)
+        const to = Math.max(0, Math.min(targetIndex, rest.length))
+        rest.splice(to, 0, personId)
+        return { ...t, memberIds: rest }
+      }),
+    }))
+  }
+
+  /** 平日轮转顺序：把某人拖到指定序号 */
+  function moveWeekdayMember(personId: string, targetIndex: number) {
+    setData((prev) => {
+      const ids = rotationPool(prev).map((p) => p.id)
+      const from = ids.indexOf(personId)
+      if (from < 0) return prev
+      const rest = ids.filter((id) => id !== personId)
+      const to = Math.max(0, Math.min(targetIndex, rest.length))
+      rest.splice(to, 0, personId)
+      return { ...prev, weekdayOrder: rest }
+    })
+  }
+
+  /** 平日轮转顺序：上下移动一位 */
+  function moveWeekdayMemberBy(personId: string, delta: number) {
+    setData((prev) => {
+      const ids = rotationPool(prev).map((p) => p.id)
+      const from = ids.indexOf(personId)
+      const target = from + delta
+      if (from < 0 || target < 0 || target >= ids.length) return prev
+      const next = [...ids]
+      const [moved] = next.splice(from, 1)
+      next.splice(target, 0, moved)
+      return { ...prev, weekdayOrder: next }
+    })
+  }
+
+  /** 恢复默认平日顺序：按 A 组在前、B 组在后的班组顺序还原 */
+  function resetWeekdayOrder() {
+    setData((prev) => ({ ...prev, weekdayOrder: defaultWeekdayOrder(prev.people, prev.teams) }))
+    setToast({ kind: 'ok', title: '已恢复默认', text: '平日轮转顺序按班组顺序还原' })
+  }
+
+  /* ------------------------------------------------------------ 拖拽排序 */
+
+  function onDragStart(event: DragEvent, source: DragSource) {
+    dragRef.current = source
+    event.dataTransfer.effectAllowed = 'move'
+    event.dataTransfer.setData('text/plain', source.personId)
+  }
+
+  function onDragEnd() {
+    dragRef.current = null
+    setOverKey(null)
+  }
+
+  function onDragLeave(event: DragEvent) {
+    const related = (event.relatedTarget as HTMLElement | null)?.closest?.('[data-drop]')
+    const current = (event.currentTarget as HTMLElement).closest('[data-drop]')
+    if (related && current && related === current) return
+    setOverKey(null)
+  }
+
+  /** 落点是否接受当前拖拽：平日只能进平日，班组只能在同一个组内 */
+  function canDrop(kind: string, teamId: TeamId | null, drag: DragSource | null): boolean {
+    if (!drag) return false
+    if (kind === 'weekday') return drag.kind === 'weekday'
+    if (kind === 'team') return drag.kind === 'team' && drag.teamId === teamId
+    return false
+  }
+
+  function onDragOver(event: DragEvent) {
+    const target = (event.target as HTMLElement).closest('[data-drop]') as HTMLElement | null
+    if (!target) return
+    const kind = target.getAttribute('data-drop') ?? ''
+    const team = target.getAttribute('data-team')
+    const teamId: TeamId | null = team === 'A' || team === 'B' ? team : null
+    if (!canDrop(kind, teamId, dragRef.current)) {
+      setOverKey(null)
+      return
+    }
+    event.preventDefault()
+    event.dataTransfer.dropEffect = 'move'
+    const key = `${kind}:${teamId ?? ''}:${target.getAttribute('data-index') ?? ''}`
+    if (key !== overKey) setOverKey(key)
+  }
+
+  function onDrop(event: DragEvent) {
+    event.preventDefault()
+    const drag = dragRef.current
+    const target = (event.target as HTMLElement).closest('[data-drop]') as HTMLElement | null
+    setOverKey(null)
+    if (!drag || !target) return
+
+    const kind = target.getAttribute('data-drop') ?? ''
+    const team = target.getAttribute('data-team')
+    const teamId: TeamId | null = team === 'A' || team === 'B' ? team : null
+    if (!canDrop(kind, teamId, drag)) return
+
+    const rawIndex = target.getAttribute('data-index')
+    const index = rawIndex === null ? -1 : Number.parseInt(rawIndex, 10)
+    if (!Number.isFinite(index) || index < 0) return
+
+    if (kind === 'weekday' && drag.kind === 'weekday') {
+      moveWeekdayMember(drag.personId, index)
+      return
+    }
+    if (kind === 'team' && drag.kind === 'team' && teamId) {
+      moveTeamMemberTo(teamId, drag.personId, index)
+    }
   }
 
   /** 人员表里直接改班组 */
@@ -752,9 +921,108 @@ export default function PeopleView({ data, setData }: Props) {
 
       <div className="panel" style={{ marginBottom: 14 }}>
         <h2>
+          <RotateIcon />
+          平日轮转顺序
+          <span className="rt">工作日「一号台 → 校对 → 扫描 → 机动」每周整体顺移一位</span>
+        </h2>
+        <div className="panel-body">
+          <div className="row" style={{ marginBottom: 10 }}>
+            <button
+              className="btn sm"
+              title="按 A 组在前、B 组在后的班组顺序还原"
+              disabled={weekdayOrderIsDefault}
+              onClick={resetWeekdayOrder}
+            >
+              <ResetIcon />
+              恢复默认
+            </button>
+            <span className="note" style={{ marginTop: 0 }}>
+              拖动姓名前的把手可调整顺序，也可用 ↑ ↓ 按钮微调。
+            </span>
+          </div>
+
+          <div className="grp-hd">
+            <i />
+            轮转池
+            <span className="cnt">{rotators.length} 人 · 大厅主班池中无固定岗者</span>
+          </div>
+          {rotators.length === 0 ? (
+            <div className="empty">还没有轮转池人员：大厅主班池中「没有固定岗」的人会进入轮转池。</div>
+          ) : (
+            <table className="tbl">
+              <thead>
+                <tr>
+                  <th style={{ width: 44 }}>序</th>
+                  <th>姓名</th>
+                  <th style={{ width: 120 }}>操作</th>
+                </tr>
+              </thead>
+              <tbody>
+                {rotators.map((person, index) => (
+                  <tr
+                    key={person.id}
+                    className={`drag-row${overKey === `weekday::${index}` ? ' drag-over' : ''}`}
+                    draggable
+                    data-drop="weekday"
+                    data-index={index}
+                    onDragStart={(e) => onDragStart(e, { kind: 'weekday', personId: person.id })}
+                    onDragEnd={onDragEnd}
+                    onDragOver={onDragOver}
+                    onDragLeave={onDragLeave}
+                    onDrop={onDrop}
+                  >
+                    <td className="num">{index + 1}</td>
+                    <td>
+                      <div className="row" style={{ gap: 6, flexWrap: 'nowrap' }}>
+                        <span className="drag-handle" aria-hidden="true">
+                          <GripIcon />
+                        </span>
+                        <span>{person.name}</span>
+                        {person.teamId ? <span className="chip">{person.teamId}组</span> : null}
+                        {person.canLead ? <span className="chip lead">组长</span> : null}
+                      </div>
+                    </td>
+                    <td>
+                      <div className="row" style={{ gap: 4, flexWrap: 'nowrap' }}>
+                        <button
+                          className="btn sm ghost"
+                          title="上移"
+                          draggable={false}
+                          disabled={index === 0}
+                          onClick={() => moveWeekdayMemberBy(person.id, -1)}
+                        >
+                          <UpIcon />
+                        </button>
+                        <button
+                          className="btn sm ghost"
+                          title="下移"
+                          draggable={false}
+                          disabled={index === rotators.length - 1}
+                          onClick={() => moveWeekdayMemberBy(person.id, 1)}
+                        >
+                          <DownIcon />
+                        </button>
+                      </div>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          )}
+
+          <p className="note">
+            这个顺序决定工作日「一号台 → 校对 → 扫描 → 机动」的每周整体顺移：第 1 位先上一号台，其余依次校对、扫描、机动，下周整体顺移一位。
+            它与 A/B 值班班组名单相互独立 —— 调整 A/B 组的成员或组内顺序，都不会打乱这里的轮转顺序。
+            轮转池 = 大厅主班池中「没有固定岗」的人（有固定岗的人不参与平日轮转）。
+          </p>
+        </div>
+      </div>
+
+      <div className="panel" style={{ marginBottom: 14 }}>
+        <h2>
           <TeamsIcon />
           值班班组
-          <span className="rt">A / B 隔周交替 · 组内顺序即轮转与借人顺序</span>
+          <span className="rt">A / B 隔周交替 · 组内顺序 = 周六位次 = 借人顺序</span>
         </h2>
         <div className="panel-body">
           <div className="grid2">
@@ -782,10 +1050,27 @@ export default function PeopleView({ data, setData }: Props) {
                       </thead>
                       <tbody>
                         {members.map((person, index) => (
-                          <tr key={person.id}>
+                          <tr
+                            key={person.id}
+                            className={`drag-row${overKey === `team:${team.id}:${index}` ? ' drag-over' : ''}`}
+                            draggable
+                            data-drop="team"
+                            data-team={team.id}
+                            data-index={index}
+                            onDragStart={(e) =>
+                              onDragStart(e, { kind: 'team', teamId: team.id, personId: person.id })
+                            }
+                            onDragEnd={onDragEnd}
+                            onDragOver={onDragOver}
+                            onDragLeave={onDragLeave}
+                            onDrop={onDrop}
+                          >
                             <td className="num">{index + 1}</td>
                             <td>
-                              <div className="row" style={{ gap: 6 }}>
+                              <div className="row" style={{ gap: 6, flexWrap: 'nowrap' }}>
+                                <span className="drag-handle" aria-hidden="true">
+                                  <GripIcon />
+                                </span>
                                 <span>{person.name}</span>
                                 {person.fixedPostId ? (
                                   <span className="chip">
@@ -800,6 +1085,7 @@ export default function PeopleView({ data, setData }: Props) {
                                 <button
                                   className="btn sm ghost"
                                   title="上移"
+                                  draggable={false}
                                   disabled={index === 0}
                                   onClick={() => moveTeamMember(team.id, person.id, -1)}
                                 >
@@ -808,6 +1094,7 @@ export default function PeopleView({ data, setData }: Props) {
                                 <button
                                   className="btn sm ghost"
                                   title="下移"
+                                  draggable={false}
                                   disabled={index === members.length - 1}
                                   onClick={() => moveTeamMember(team.id, person.id, 1)}
                                 >
@@ -816,6 +1103,7 @@ export default function PeopleView({ data, setData }: Props) {
                                 <button
                                   className="btn sm ghost"
                                   title="移出该组"
+                                  draggable={false}
                                   onClick={() => removeTeamMember(team.id, person.id)}
                                 >
                                   <TrashIcon />
@@ -862,8 +1150,9 @@ export default function PeopleView({ data, setData }: Props) {
           </div>
 
           <p className="note">
-            A、B 两组隔周交替承担周六及法定假日值班，值班时整组上岗。组内顺序决定轮转先后，也是 B 组缺人时的借人顺序：
-            B 组比 A 组少 1 人，按 A 组名单顺序一人一次轮借、循环使用。调整顺序请用上下移动按钮。
+            A、B 两组隔周交替承担周六及法定假日值班，值班时整组上岗。组内顺序 = 周六当天按组内顺序填岗位位次 = B 组向 A 组借人的先后顺序：
+            B 组比 A 组少 1 人，按 A 组名单顺序一人一次轮借、循环使用。调整顺序可拖拽行首把手，或用上下移动按钮。
+            拖拽只在同一个组内有效；跨组请先用「移出该组」再「加入」。
           </p>
         </div>
       </div>
