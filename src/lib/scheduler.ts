@@ -43,6 +43,15 @@ export interface DayPlan {
   capacity: number
   /** 当天在岗人数（不含独立岗 512） */
   onDuty: number
+  /**
+   * 当天核心位次实到人数（不含 512，也不含机动岗）。
+   *
+   * 「每日最少在岗 8 人」说的就是这 8 个核心位次；机动岗是补缺用的浮动岗，
+   * 把它算进基数会让缺岗永远看不出来，所以单独统计。
+   */
+  coreOnDuty: number
+  /** 当天核心位次总数（机动岗 0~3 与 512 都不计） */
+  coreCapacity: number
   /** 当天值班组长（大厅，不在岗时为 null） */
   leaderId: string | null
   /** 512 柜台组长（不在岗时为 null） */
@@ -153,20 +162,20 @@ function fixedPostIds(data: AppData): Set<string> {
 /**
  * 工作日轮转池：大厅主班池中「没有固定岗」的人。
  *
- * 顺序 = 值班班组顺序（A 组在前、B 组在后）→ 与用户给的名单一致：
- * 杨娟、朱婕、林丽雯、耿园园、王玉花、汪甜、陈静静
+ * 顺序 = 平日轮转顺序（AppData.weekdayOrder），可在「人员」页拖拽调整。
+ * 名单里没排上的人（后加入轮转池）按 order 追加到末尾。
  */
 export function rotationPool(data: AppData): Person[] {
-  const teamIndex = new Map<string, number>()
-  let index = 0
-  for (const team of data.teams) {
-    for (const personId of team.memberIds) teamIndex.set(personId, index++)
-  }
+  const index = new Map<string, number>()
+  const order = data.weekdayOrder ?? []
+  order.forEach((id, i) => {
+    if (!index.has(id)) index.set(id, i)
+  })
   return data.people
     .filter((p) => p.active && p.pool === 'main' && !p.fixedPostId)
     .sort((a, b) => {
-      const ta = teamIndex.get(a.id)
-      const tb = teamIndex.get(b.id)
+      const ta = index.get(a.id)
+      const tb = index.get(b.id)
       if (ta !== undefined && tb !== undefined) return ta - tb
       if (ta !== undefined) return -1
       if (tb !== undefined) return 1
@@ -636,9 +645,12 @@ function buildPlan(args: BuildArgs): DayPlan {
 
   let onDuty = 0
   let capacity = 0
+  let coreOnDuty = 0
+  let coreCapacity = 0
   for (const post of data.posts) {
     if (post.separate) continue
     capacity += slotCount.get(post.id)!
+    if (post.flexMode !== 'leftover') coreCapacity += slotCount.get(post.id)!
   }
   for (const person of ctx.active) {
     const postId = ctx.byPerson.get(person.id)
@@ -646,6 +658,7 @@ function buildPlan(args: BuildArgs): DayPlan {
     const post = data.posts.find((p) => p.id === postId)
     if (post?.separate) continue
     onDuty++
+    if (post && post.flexMode !== 'leftover') coreOnDuty++
   }
 
   return {
@@ -663,6 +676,8 @@ function buildPlan(args: BuildArgs): DayPlan {
     slotCount,
     capacity,
     onDuty,
+    coreOnDuty,
+    coreCapacity,
     leaderId: args.leaderId,
     counterLeaderId: args.counterLeaderId,
     leaderVacant: args.leaderVacant,
@@ -884,13 +899,13 @@ export function buildAlerts(data: AppData, dates: string[]): AlertSummary {
     const plan = planDay(data, date)
     if (!plan.working) continue
 
-    if (plan.onDuty < min) {
+    if (plan.coreOnDuty < min) {
       errors++
       alerts.push({
         level: 'error',
         date,
-        title: `${shortDate(date)} ${weekdayLabel(date)} 在岗 ${plan.onDuty} 人`,
-        detail: `低于每日最少在岗 ${min} 人，缺 ${min - plan.onDuty} 人`,
+        title: `${shortDate(date)} ${weekdayLabel(date)} 核心位次 ${plan.coreOnDuty}/${plan.coreCapacity}`,
+        detail: `低于每日最少在岗 ${min} 人，缺 ${min - plan.coreOnDuty} 人（机动顶岗不计入基数）`,
       })
     }
 

@@ -104,6 +104,13 @@ export interface AppData {
   people: Person[]
   posts: Post[]
   teams: Team[]
+  /**
+   * 平日轮转顺序（人员 id 数组）。
+   *
+   * 决定工作日「一号台 → 校对 → 扫描 → 机动」的每周整体顺移，
+   * 与值班班组名单顺序相互独立：改 A/B 组名单不影响平日轮转。
+   */
+  weekdayOrder: string[]
   /** 节假日等单日状态覆盖：日期 -> 上班 / 放假 */
   days: Record<string, DayState>
   /** 逐日岗位安排覆盖：日期 -> 岗位id -> 位次槽位（人员id 或 null 表示空缺） */

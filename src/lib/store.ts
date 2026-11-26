@@ -2,9 +2,9 @@ import type { AppData, DayState, LeaveRecord, LedgerEntry, Person, Post, Team, T
 import { startOfWeek, toISO } from './date'
 import { planDay, capacityOf } from './scheduler'
 
-const STORAGE_KEY = 'paiban.data.v4'
+const STORAGE_KEY = 'paiban.data.v5'
 /** 历史版本 key，读取时按顺序尝试迁移 */
-const LEGACY_KEYS = ['paiban.data.v3', 'paiban.data.v2', 'paiban.data.v1']
+const LEGACY_KEYS = ['paiban.data.v4', 'paiban.data.v3', 'paiban.data.v2', 'paiban.data.v1']
 
 export const POST_COLORS = [
   '#0e7c66',
@@ -19,6 +19,33 @@ export const POST_COLORS = [
 
 export function uid(prefix: string): string {
   return `${prefix}_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 7)}`
+}
+
+/**
+ * 平日轮转顺序的默认值。
+ *
+ * 按值班班组顺序（A 组在前、B 组在后）取大厅主班池中「没有固定岗」的人，
+ * 与 v4 时期由班组名单推导轮转池的行为一致 —— 迁移时用它补齐 weekdayOrder。
+ */
+export function defaultWeekdayOrder(people: Person[], teams: Team[]): string[] {
+  const teamIndex = new Map<string, number>()
+  let index = 0
+  for (const team of teams) {
+    for (const personId of team.memberIds) {
+      if (!teamIndex.has(personId)) teamIndex.set(personId, index++)
+    }
+  }
+  return people
+    .filter((p) => p.active && p.pool === 'main' && !p.fixedPostId)
+    .sort((a, b) => {
+      const ta = teamIndex.get(a.id)
+      const tb = teamIndex.get(b.id)
+      if (ta !== undefined && tb !== undefined) return ta - tb
+      if (ta !== undefined) return -1
+      if (tb !== undefined) return 1
+      return a.order - b.order
+    })
+    .map((p) => p.id)
 }
 
 /**
@@ -137,7 +164,7 @@ export function seedData(): AppData {  const posts: Post[] = SEED_POSTS.map((p, 
   }))
 
   return {
-    version: 4,
+    version: 5,
     settings: {
       orgName: '综合班组',
       startDate: startOfWeek(toISO(new Date())),
@@ -148,6 +175,7 @@ export function seedData(): AppData {  const posts: Post[] = SEED_POSTS.map((p, 
     people,
     posts,
     teams,
+    weekdayOrder: defaultWeekdayOrder(people, teams),
     days: {},
     dayPlans: {},
     dayLeaders: {},
@@ -233,6 +261,10 @@ export function normalize(input: Raw): AppData {
 
   const dayPlans: Record<string, Record<string, (string | null)[]>> = {}
   if (source.dayPlans && typeof source.dayPlans === 'object') {
+    // 手工覆盖的语义是「替换当天全部安排」，所以一份完整的覆盖必然包含全部岗位。
+    // 旧岗位模型迁过来的残缺覆盖（缺 扫描 / 512）会让整天有岗位空着，
+    // 这里直接丢弃这类不完整的覆盖，让当天回到自动排班。
+    const requiredPostIds = posts.map((p) => p.id)
     for (const [date, plan] of Object.entries(source.dayPlans as Record<string, unknown>)) {
       if (!plan || typeof plan !== 'object') continue
       const entry: Record<string, (string | null)[]> = {}
@@ -241,6 +273,8 @@ export function normalize(input: Raw): AppData {
           entry[postId] = slots.map((id) => (id === null || id === undefined ? null : String(id)))
         }
       }
+      const complete = requiredPostIds.every((id) => id in entry)
+      if (!complete) continue
       dayPlans[date] = entry
     }
   }
@@ -280,8 +314,15 @@ export function normalize(input: Raw): AppData {
         }))
     : []
 
+  // 平日轮转顺序：保留用户手工调整的先后，新进轮转池的人追加到末尾
+  const pool = defaultWeekdayOrder(people, teams)
+  const kept = Array.isArray(source.weekdayOrder)
+    ? source.weekdayOrder.map(String).filter((id) => pool.includes(id))
+    : []
+  const weekdayOrder = [...kept, ...pool.filter((id) => !kept.includes(id))]
+
   return {
-    version: 4,
+    version: 5,
     settings: {
       orgName: String(source.settings?.orgName ?? seed.settings.orgName),
       startDate: String(source.settings?.startDate ?? seed.settings.startDate),
@@ -293,6 +334,7 @@ export function normalize(input: Raw): AppData {
     people,
     posts,
     teams,
+    weekdayOrder,
     days,
     dayPlans,
     dayLeaders,
@@ -516,7 +558,7 @@ function migrateV3toV4(input: Raw): AppData {
   }))
 
   const base: AppData = {
-    version: 4,
+    version: 5,
     settings: {
       orgName: String(source.settings?.orgName ?? '综合班组'),
       startDate: String(source.settings?.startDate ?? startOfWeek(toISO(new Date()))),
@@ -527,6 +569,7 @@ function migrateV3toV4(input: Raw): AppData {
     people,
     posts: seed.posts,
     teams,
+    weekdayOrder: defaultWeekdayOrder(people, teams),
     days:
       source.days && typeof source.days === 'object'
         ? (Object.fromEntries(
@@ -541,31 +584,18 @@ function migrateV3toV4(input: Raw): AppData {
     ledger: Array.isArray(source.ledger) ? source.ledger : [],
   }
 
-  // v3 dayPlans：岗位 id 改名 + 校对扫描并入校对
-  const legacyPlans: Record<string, Record<string, unknown>> =
-    source.dayPlans && typeof source.dayPlans === 'object' ? source.dayPlans : {}
-  for (const [date, plan] of Object.entries(legacyPlans)) {
-    if (!plan || typeof plan !== 'object') continue
-    const entry: Record<string, (string | null)[]> = {}
-    for (const [postId, slots] of Object.entries(plan)) {
-      if (!Array.isArray(slots)) continue
-      const target = mapPostId(postId)
-      const values = slots.map((id) => (id === null || id === undefined ? null : String(id)))
-      if (target === 'post_3') {
-        // 校对扫描 -> 校对（保留 2 个位次），扫描另起
-        entry.post_3 = values.slice(0, 2)
-        while (entry.post_3.length < 2) entry.post_3.push(null)
-      } else {
-        entry[target] = values
-      }
-    }
-    base.dayPlans[date] = entry
-  }
+  // v3 的手工覆盖一律丢弃。
+  //
+  // 覆盖的语义是「替换当天全部安排」，而 v3 → v4 换了岗位模型
+  // （校对扫描拆成校对 + 扫描、新增 512 独立岗、周六位次由 11 改 8）。
+  // 旧覆盖即使改了岗位 id 也必然缺少扫描与 512，迁过来会让整天有岗位空着，
+  // 与其留一份坏数据，不如让当天回到自动排班。v4 的数据不受影响（不经过这里）。
+  base.dayPlans = {}
 
   return base
 }
 
-/** 尝试把任意历史版本数据迁移到 v4 */
+/** 尝试把任意历史版本数据迁移到 v5 */
 export function migrate(raw: Raw): AppData {
   const source = raw && typeof raw === 'object' ? raw : {}
   const version = Number(source.version ?? 1)
