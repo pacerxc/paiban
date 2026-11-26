@@ -1,10 +1,10 @@
-import type { AppData, Crew, DayState, LeaveRecord, LedgerEntry, Person, Post } from '../types'
+import type { AppData, DayState, LeaveRecord, LedgerEntry, Person, Post, Team, TeamId } from '../types'
 import { startOfWeek, toISO } from './date'
 import { planDay, capacityOf } from './scheduler'
 
-const STORAGE_KEY = 'paiban.data.v3'
+const STORAGE_KEY = 'paiban.data.v4'
 /** 历史版本 key，读取时按顺序尝试迁移 */
-const LEGACY_KEYS = ['paiban.data.v2', 'paiban.data.v1']
+const LEGACY_KEYS = ['paiban.data.v3', 'paiban.data.v2', 'paiban.data.v1']
 
 export const POST_COLORS = [
   '#0e7c66',
@@ -13,35 +13,68 @@ export const POST_COLORS = [
   '#b0446a',
   '#3f7a3f',
   '#8a6a2f',
+  '#5b6472',
+  '#7a5ba6',
 ]
 
 export function uid(prefix: string): string {
   return `${prefix}_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 7)}`
 }
 
-/** 6 个岗位组：工作日 8 位次，周六 11 位次 */
-export const SEED_POSTS: Array<{ id: string; name: string; capacity: number; saturdayCapacity: number }> = [
+/**
+ * 8 个岗位：
+ * - 工作日（周一~周五）：一号台1 受理2 校对2 扫描1 照相1 填表1 机动0~3，另有 512 柜台 4 人（独立岗）
+ * - 周六 / 法定调休上班日：一号台2 填表2 受理3 照相1，无校对/扫描/机动，无 512
+ */
+export const SEED_POSTS: Array<{
+  id: string
+  name: string
+  capacity: number
+  saturdayCapacity: number
+  separate?: boolean
+  flexMode?: 'leftover' | 'available'
+}> = [
   { id: 'post_1', name: '一号台', capacity: 1, saturdayCapacity: 2 },
   { id: 'post_2', name: '受理', capacity: 2, saturdayCapacity: 3 },
-  { id: 'post_3', name: '校对扫描', capacity: 2, saturdayCapacity: 2 },
-  { id: 'post_4', name: '照相', capacity: 1, saturdayCapacity: 1 },
-  { id: 'post_5', name: '填表', capacity: 1, saturdayCapacity: 2 },
-  { id: 'post_6', name: '机动', capacity: 1, saturdayCapacity: 1 },
+  { id: 'post_3', name: '校对', capacity: 2, saturdayCapacity: 0 },
+  { id: 'post_4', name: '扫描', capacity: 1, saturdayCapacity: 0 },
+  { id: 'post_5', name: '照相', capacity: 1, saturdayCapacity: 1 },
+  { id: 'post_6', name: '填表', capacity: 1, saturdayCapacity: 2 },
+  { id: 'post_7', name: '机动', capacity: 3, saturdayCapacity: 0, flexMode: 'leftover' },
+  {
+    id: 'post_8',
+    name: '512',
+    capacity: 4,
+    saturdayCapacity: 0,
+    separate: true,
+    flexMode: 'available',
+  },
 ]
 
-export const SEED_CREWS: Crew[] = [
-  { id: 'A', name: '甲组' },
-  { id: 'B', name: '乙组' },
-]
+/** 值班班组：顺序即轮转顺序 / B 组向 A 组借人的顺序 */
+export const SEED_TEAM_NAMES: Record<TeamId, string[]> = {
+  A: ['杨娟', '朱婕', '颜贞贞', '林丽雯', '耿园园', '贺夏炎', '艾丽娜', '查云'],
+  B: ['王玉花', '杨雯', '汪甜', '周娟', '陈静静', '顾彬彬', '唐小雨'],
+}
 
-/** 组长池 */
-const LEADER_NAMES = ['王玉花', '杨娟', '汪甜']
+/** 组长池：前三位管除 512 外的岗位，艾丽娜只管 512 */
+const HALL_LEADERS = ['王玉花', '杨娟', '汪甜']
+const COUNTER_LEADERS = ['艾丽娜']
+
+/** 大厅组长轮值顺序：王玉花 → 杨娟 → 汪甜（逐日轮） */
+const HALL_LEADER_SEQUENCE = ['王玉花', '杨娟', '汪甜']
+
+/** 某个人的大厅组长轮值序号；不是大厅组长则返回 undefined */
+function leaderOrderOf(name: string): number | undefined {
+  const index = HALL_LEADER_SEQUENCE.indexOf(name)
+  return index >= 0 ? index + 1 : undefined
+}
 
 interface SeedPerson {
   name: string
-  pool?: 'main' | 'support'
-  crew?: 'A' | 'B'
+  pool?: 'main' | 'counter'
   canLead?: boolean
+  leaderScope?: 'hall' | 'counter'
   fixedPost?: string
   allowedPosts?: string[]
   note?: string
@@ -50,56 +83,71 @@ interface SeedPerson {
 const SEED_PEOPLE: SeedPerson[] = [
   { name: '周娟', fixedPost: 'post_2' },
   { name: '朱婕' },
-  { name: '杨娟', canLead: true },
-  { name: '杨雯', fixedPost: 'post_5' },
+  { name: '杨娟', canLead: true, leaderScope: 'hall' },
+  { name: '杨雯', fixedPost: 'post_6' },
   { name: '林丽雯' },
-  { name: '汪甜', canLead: true },
-  { name: '王玉花', canLead: true },
+  { name: '汪甜', canLead: true, leaderScope: 'hall' },
+  { name: '王玉花', canLead: true, leaderScope: 'hall' },
   { name: '耿园园' },
   { name: '贺夏炎', fixedPost: 'post_2' },
   { name: '陈静静' },
-  { name: '颜贞贞', fixedPost: 'post_4', note: '照相岗优先岗，缺人时全员可顶' },
-  { name: '顾彬彬', pool: 'support', crew: 'A' },
-  { name: '唐小雨', pool: 'support', crew: 'A' },
-  { name: '查云', pool: 'support', crew: 'B' },
-  { name: '艾丽娜', pool: 'support', crew: 'B' },
+  { name: '颜贞贞', fixedPost: 'post_5', note: '照相岗固定岗，缺人时全员可顶' },
+  { name: '顾彬彬', pool: 'counter' },
+  { name: '唐小雨', pool: 'counter' },
+  { name: '查云', pool: 'counter' },
+  { name: '艾丽娜', pool: 'counter', canLead: true, leaderScope: 'counter', note: '512 柜台负责人' },
 ]
 
-export function seedData(): AppData {
-  const posts: Post[] = SEED_POSTS.map((p, i) => ({
+export function seedData(): AppData {  const posts: Post[] = SEED_POSTS.map((p, i) => ({
     id: p.id,
     name: p.name,
     capacity: p.capacity,
     saturdayCapacity: p.saturdayCapacity,
     color: POST_COLORS[i % POST_COLORS.length],
+    separate: p.separate,
+    flexMode: p.flexMode,
   }))
 
-  const people: Person[] = SEED_PEOPLE.map((seed, i) => ({
-    id: `person_${i + 1}`,
-    name: seed.name,
-    order: i + 1,
-    pool: seed.pool ?? 'main',
-    crew: seed.crew ?? null,
-    canLead: seed.canLead === true,
-    allowedPostIds: seed.allowedPosts ?? null,
-    fixedPostId: seed.fixedPost ?? null,
-    active: true,
-    note: seed.note,
+  const people: Person[] = SEED_PEOPLE.map((seed, i) => {
+    const teamId = (Object.keys(SEED_TEAM_NAMES) as TeamId[]).find((id) =>
+      SEED_TEAM_NAMES[id].includes(seed.name),
+    )
+    return {
+      id: `person_${i + 1}`,
+      name: seed.name,
+      order: i + 1,
+      pool: seed.pool ?? 'main',
+      teamId: teamId ?? null,
+      canLead: seed.canLead === true,
+      leaderScope: seed.leaderScope,
+      leaderOrder: seed.leaderScope === 'counter' ? 1 : leaderOrderOf(seed.name),
+      allowedPostIds: seed.allowedPosts ?? null,
+      fixedPostId: seed.fixedPost ?? null,
+      active: true,
+      note: seed.note,
+    }
+  })
+
+  const teams: Team[] = (['A', 'B'] as TeamId[]).map((id) => ({
+    id,
+    name: id === 'A' ? 'A组' : 'B组',
+    memberIds: SEED_TEAM_NAMES[id]
+      .map((name) => people.find((p) => p.name === name)?.id)
+      .filter((x): x is string => !!x),
   }))
 
   return {
-    version: 3,
+    version: 4,
     settings: {
       orgName: '综合班组',
       startDate: startOfWeek(toISO(new Date())),
       restQuotaDays: 8,
       minDailyHeadcount: 8,
-      supportSlots: 2,
-      crewAlternate: true,
+      firstTeam: 'A',
     },
     people,
     posts,
-    crews: SEED_CREWS,
+    teams,
     days: {},
     dayPlans: {},
     dayLeaders: {},
@@ -113,6 +161,7 @@ export function blankData(current: AppData): AppData {
   return {
     ...current,
     people: [],
+    teams: current.teams.map((t) => ({ ...t, memberIds: [] })),
     days: {},
     dayPlans: {},
     dayLeaders: {},
@@ -129,9 +178,11 @@ function normalizePeople(source: Raw, fallback: Person[]): Person[] {
     id: String(p.id ?? uid('person')),
     name: String(p.name ?? '未命名'),
     order: Number(p.order ?? i + 1) || i + 1,
-    pool: p.pool === 'support' ? 'support' : 'main',
-    crew: p.crew === 'A' || p.crew === 'B' ? p.crew : null,
+    pool: p.pool === 'counter' || p.pool === 'support' ? 'counter' : 'main',
+    teamId: p.teamId === 'A' || p.teamId === 'B' ? p.teamId : null,
     canLead: p.canLead === true,
+    leaderScope: p.leaderScope === 'counter' ? 'counter' : p.leaderScope === 'hall' ? 'hall' : undefined,
+    leaderOrder: Number.isFinite(Number(p.leaderOrder)) ? Number(p.leaderOrder) : undefined,
     allowedPostIds: Array.isArray(p.allowedPostIds) ? p.allowedPostIds.map(String) : null,
     fixedPostId: p.fixedPostId ? String(p.fixedPostId) : null,
     active: p.active !== false,
@@ -150,8 +201,19 @@ function normalizePosts(source: Raw, fallback: Post[]): Post[] {
       capacity,
       saturdayCapacity,
       color: String(p.color ?? POST_COLORS[i % POST_COLORS.length]),
+      separate: p.separate === true,
+      flexMode: p.flexMode === 'leftover' || p.flexMode === 'available' ? p.flexMode : undefined,
     }
   })
+}
+
+function normalizeTeams(source: Raw, fallback: Team[]): Team[] {
+  if (!Array.isArray(source.teams) || source.teams.length === 0) return fallback
+  return source.teams.map((t: Raw, i: number) => ({
+    id: (t.id === 'B' ? 'B' : 'A') as TeamId,
+    name: String(t.name ?? (t.id === 'B' ? 'B组' : 'A组')),
+    memberIds: Array.isArray(t.memberIds) ? t.memberIds.map(String) : [],
+  }))
 }
 
 export function normalize(input: Raw): AppData {
@@ -160,6 +222,7 @@ export function normalize(input: Raw): AppData {
 
   const people = normalizePeople(source, seed.people)
   const posts = normalizePosts(source, seed.posts)
+  const teams = normalizeTeams(source, seed.teams)
 
   const days: Record<string, DayState> = {}
   if (source.days && typeof source.days === 'object') {
@@ -218,19 +281,18 @@ export function normalize(input: Raw): AppData {
     : []
 
   return {
-    version: 3,
+    version: 4,
     settings: {
       orgName: String(source.settings?.orgName ?? seed.settings.orgName),
       startDate: String(source.settings?.startDate ?? seed.settings.startDate),
       restQuotaDays: Number(source.settings?.restQuotaDays ?? seed.settings.restQuotaDays) || 8,
       minDailyHeadcount:
-        Number(source.settings?.minDailyHeadcount ?? seed.settings.minDailyHeadcount) || 8,
-      supportSlots: Number(source.settings?.supportSlots ?? seed.settings.supportSlots) || 2,
-      crewAlternate: source.settings?.crewAlternate !== false,
+        Number(source.settings?.minDailyHeadCount ?? seed.settings.minDailyHeadcount) || 8,
+      firstTeam: source.settings?.firstTeam === 'B' ? 'B' : 'A',
     },
     people,
     posts,
-    crews: Array.isArray(source.crews) && source.crews.length ? source.crews : seed.crews,
+    teams,
     days,
     dayPlans,
     dayLeaders,
@@ -243,17 +305,18 @@ export function normalize(input: Raw): AppData {
  * 旧版本迁移
  * ------------------------------------------------------------------ */
 
-/** 旧岗位名 -> 新岗位组 id */
+/** 旧岗位名 -> 新岗位 id */
 const LEGACY_POST_MAP: Record<string, string> = {
   一号台: 'post_1',
   受理: 'post_2',
   校对: 'post_3',
   扫描: 'post_3',
   校对扫描: 'post_3',
-  拍照: 'post_4',
-  照相: 'post_4',
-  填表: 'post_5',
-  机动: 'post_6',
+  拍照: 'post_5',
+  照相: 'post_5',
+  填表: 'post_6',
+  机动: 'post_7',
+  '512': 'post_8',
 }
 
 /** v1 -> v2：v1 字段更少，补齐默认值即可 */
@@ -295,7 +358,7 @@ function migrateV1toV2(input: Raw): Raw {
 }
 
 /** v2 -> v3：岗位重组、支援池拆分、组长池、dayPosts -> dayPlans */
-function migrateV2toV3(input: Raw): AppData {
+function migrateV2toV3(input: Raw): Raw {
   const source = input && typeof input === 'object' ? input : {}
   const legacyPosts: Raw[] = Array.isArray(source.posts) ? source.posts : []
   const legacyPostById = new Map<string, Raw>()
@@ -313,31 +376,30 @@ function migrateV2toV3(input: Raw): AppData {
     return direct ? direct.id : null
   }
 
-  // 人员：saturdayOnly -> pool/crew，组长池 -> canLead
   const rawPeople: Raw[] = Array.isArray(source.people) ? source.people : []
   const supportNames = rawPeople
     .filter((p) => p.saturdayOnly === true)
     .map((p) => String(p.name ?? ''))
-  const people: Person[] = rawPeople.map((p: Raw, i: number) => {
+  const people = rawPeople.map((p: Raw, i: number) => {
     const name = String(p.name ?? '未命名')
     const supportIndex = supportNames.indexOf(name)
     return {
       id: String(p.id ?? `person_${i + 1}`),
       name,
       order: Number(p.order ?? i + 1) || i + 1,
-      pool: p.saturdayOnly === true ? 'support' : 'main',
+      pool: p.saturdayOnly === true ? 'counter' : 'main',
       crew: p.saturdayOnly === true ? (supportIndex % 2 === 0 ? 'A' : 'B') : null,
-      canLead: LEADER_NAMES.includes(name),
+      canLead: HALL_LEADERS.includes(name),
       allowedPostIds: Array.isArray(p.allowedPostIds)
         ? p.allowedPostIds.map((id) => mapPostId(String(id))).filter((x): x is string => !!x)
         : null,
-      fixedPostId: p.fixedPostId ? mapPostId(String(p.fixedPostId)) : null,
+      fixedPostId: p.fixedPostId ? mapPostId(p.fixedPostId) : null,
       active: p.active !== false,
       note: p.note ? String(p.note) : undefined,
     }
   })
 
-  const posts: Post[] = SEED_POSTS.map((p, i) => ({
+  const posts = SEED_POSTS.map((p, i) => ({
     id: p.id,
     name: p.name,
     capacity: p.capacity,
@@ -345,7 +407,8 @@ function migrateV2toV3(input: Raw): AppData {
     color: POST_COLORS[i % POST_COLORS.length],
   }))
 
-  const base: AppData = {
+  return {
+    ...source,
     version: 3,
     settings: {
       orgName: String(source.settings?.orgName ?? '综合班组'),
@@ -357,7 +420,10 @@ function migrateV2toV3(input: Raw): AppData {
     },
     people,
     posts,
-    crews: SEED_CREWS,
+    crews: [
+      { id: 'A', name: '甲组' },
+      { id: 'B', name: '乙组' },
+    ],
     days:
       source.days && typeof source.days === 'object'
         ? (Object.fromEntries(
@@ -379,60 +445,134 @@ function migrateV2toV3(input: Raw): AppData {
         }))
       : [],
   }
+}
 
-  // dayPosts（日期|人员 -> 岗位id 或 ''）-> dayPlans（日期 -> 岗位 -> 人员数组）
-  const legacyDayPosts: Record<string, string> =
-    source.dayPosts && typeof source.dayPosts === 'object' ? source.dayPosts : {}
-  const dates = new Set<string>()
-  const perDate = new Map<string, Array<{ personId: string; postId: string | null }>>()
-  for (const [key, postId] of Object.entries(legacyDayPosts)) {
-    const sep = key.indexOf('|')
-    if (sep < 0) continue
-    const date = key.slice(0, sep)
-    const personId = key.slice(sep + 1)
-    dates.add(date)
-    const list = perDate.get(date) ?? []
-    list.push({ personId, postId: postId ? mapPostId(postId) : null })
-    perDate.set(date, list)
+/**
+ * v3 -> v4：新增 512 独立岗、校对/扫描拆分、A/B 值班班组、4 个组长。
+ *
+ * v3 的「校对扫描」位次并入新「校对」岗；新「扫描」岗留空，由轮转补位。
+ */
+function migrateV3toV4(input: Raw): AppData {
+  const source = input && typeof input === 'object' ? input : {}
+  const seed = seedData()
+
+  const rawPeople: Raw[] = Array.isArray(source.people) ? source.people : []
+  const nameById = new Map<string, string>()
+  for (const p of rawPeople) nameById.set(String(p.id), String(p.name ?? ''))
+
+  // v3 岗位 id -> v4 岗位 id
+  const POST_ID_MAP: Record<string, string> = {
+    post_1: 'post_1',
+    post_2: 'post_2',
+    post_3: 'post_3', // 校对扫描 -> 校对
+    post_4: 'post_5', // 照相
+    post_5: 'post_6', // 填表
+    post_6: 'post_7', // 机动
+  }
+  const mapPostId = (rawId: string): string => {
+    if (POST_ID_MAP[rawId]) return POST_ID_MAP[rawId]
+    const byName = Object.entries(LEGACY_POST_MAP).find(([name]) => name === rawId)
+    return byName ? byName[1] : rawId
   }
 
-  for (const date of dates) {
-    const plan = planDay(base, date)
-    const postsOfDay: Record<string, (string | null)[]> = {}
-    for (const post of posts) {
-      const cap = capacityOf(post, date)
-      const ids = plan.byPost.get(post.id) ?? []
-      const arr: (string | null)[] = ids.slice(0, cap)
-      while (arr.length < cap) arr.push(null)
-      postsOfDay[post.id] = arr
+  const teamOf = (name: string): TeamId | null => {
+    if (SEED_TEAM_NAMES.A.includes(name)) return 'A'
+    if (SEED_TEAM_NAMES.B.includes(name)) return 'B'
+    return null
+  }
+
+  const people: Person[] = rawPeople.map((p: Raw, i: number) => {
+    const name = String(p.name ?? '未命名')
+    const isCounter = p.pool === 'support' || p.pool === 'counter'
+    const canLead = HALL_LEADERS.includes(name) || COUNTER_LEADERS.includes(name)
+    return {
+      id: String(p.id ?? `person_${i + 1}`),
+      name,
+      order: Number(p.order ?? i + 1) || i + 1,
+      pool: isCounter ? 'counter' : 'main',
+      teamId: teamOf(name),
+      canLead,
+      leaderScope: COUNTER_LEADERS.includes(name)
+        ? 'counter'
+        : HALL_LEADERS.includes(name)
+          ? 'hall'
+          : undefined,
+      leaderOrder: COUNTER_LEADERS.includes(name) ? 1 : leaderOrderOf(name),
+      allowedPostIds: Array.isArray(p.allowedPostIds)
+        ? p.allowedPostIds.map((id) => mapPostId(String(id)))
+        : null,
+      fixedPostId: p.fixedPostId ? mapPostId(String(p.fixedPostId)) : null,
+      active: p.active !== false,
+      note: p.note ? String(p.note) : undefined,
     }
-    for (const item of perDate.get(date) ?? []) {
-      // 先从所有岗位腾出槽位，再落到目标岗位
-      for (const post of posts) {
-        const arr = postsOfDay[post.id]
-        const idx = arr.indexOf(item.personId)
-        if (idx >= 0) arr[idx] = null
-      }
-      if (item.postId && postsOfDay[item.postId]) {
-        const arr = postsOfDay[item.postId]
-        const empty = arr.indexOf(null)
-        if (empty >= 0) arr[empty] = item.personId
-        else arr.push(item.personId)
+  })
+
+  const teams: Team[] = (['A', 'B'] as TeamId[]).map((id) => ({
+    id,
+    name: id === 'A' ? 'A组' : 'B组',
+    memberIds: SEED_TEAM_NAMES[id]
+      .map((name) => people.find((p) => p.name === name)?.id)
+      .filter((x): x is string => !!x),
+  }))
+
+  const base: AppData = {
+    version: 4,
+    settings: {
+      orgName: String(source.settings?.orgName ?? '综合班组'),
+      startDate: String(source.settings?.startDate ?? startOfWeek(toISO(new Date()))),
+      restQuotaDays: 8,
+      minDailyHeadcount: 8,
+      firstTeam: 'A',
+    },
+    people,
+    posts: seed.posts,
+    teams,
+    days:
+      source.days && typeof source.days === 'object'
+        ? (Object.fromEntries(
+            Object.entries(source.days as Record<string, unknown>).filter(
+              ([, v]) => v === 'work' || v === 'off',
+            ),
+          ) as Record<string, DayState>)
+        : {},
+    dayPlans: {},
+    dayLeaders: {},
+    leaves: Array.isArray(source.leaves) ? source.leaves : [],
+    ledger: Array.isArray(source.ledger) ? source.ledger : [],
+  }
+
+  // v3 dayPlans：岗位 id 改名 + 校对扫描并入校对
+  const legacyPlans: Record<string, Record<string, unknown>> =
+    source.dayPlans && typeof source.dayPlans === 'object' ? source.dayPlans : {}
+  for (const [date, plan] of Object.entries(legacyPlans)) {
+    if (!plan || typeof plan !== 'object') continue
+    const entry: Record<string, (string | null)[]> = {}
+    for (const [postId, slots] of Object.entries(plan)) {
+      if (!Array.isArray(slots)) continue
+      const target = mapPostId(postId)
+      const values = slots.map((id) => (id === null || id === undefined ? null : String(id)))
+      if (target === 'post_3') {
+        // 校对扫描 -> 校对（保留 2 个位次），扫描另起
+        entry.post_3 = values.slice(0, 2)
+        while (entry.post_3.length < 2) entry.post_3.push(null)
+      } else {
+        entry[target] = values
       }
     }
-    base.dayPlans[date] = postsOfDay
+    base.dayPlans[date] = entry
   }
 
   return base
 }
 
-/** 尝试把任意历史版本数据迁移到 v3 */
+/** 尝试把任意历史版本数据迁移到 v4 */
 export function migrate(raw: Raw): AppData {
   const source = raw && typeof raw === 'object' ? raw : {}
   const version = Number(source.version ?? 1)
-  if (version >= 3) return normalize(source)
-  if (version === 2) return migrateV2toV3(source)
-  return migrateV2toV3(migrateV1toV2(source))
+  if (version >= 4) return normalize(source)
+  if (version === 3) return migrateV3toV4(source)
+  if (version === 2) return migrateV3toV4(migrateV2toV3(source))
+  return migrateV3toV4(migrateV2toV3(migrateV1toV2(source)))
 }
 
 export function loadData(): AppData {
@@ -472,3 +612,5 @@ export function storageAvailable(): boolean {
     return false
   }
 }
+
+export { planDay, capacityOf }

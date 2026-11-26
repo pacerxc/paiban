@@ -125,8 +125,12 @@ export function exportPostTableCsv(data: AppData, weekStart: string, filename?: 
   })])
 
   for (const post of data.posts) {
-    const capacity = dates[0] ? postCapacity(data, post.id, dates[0]) : post.capacity
-    for (let slot = 0; slot < capacity; slot++) {
+    if (post.separate) continue
+    const slotCount = Math.max(
+      ...dates.map((date) => plans.get(date)!.slotCount.get(post.id) ?? 0),
+      0,
+    )
+    for (let slot = 0; slot < slotCount; slot++) {
       rows.push([
         slot === 0 ? post.name : '',
         ...dates.map((date) => {
@@ -136,7 +140,30 @@ export function exportPostTableCsv(data: AppData, weekStart: string, filename?: 
           const personId = ids[slot]
           if (!personId) return ''
           const name = nameById.get(personId) ?? ''
-          return plan.leaderId === personId ? `${name}★` : name
+          const isLeader = plan.leaderId === personId
+          return isLeader ? `${name}★` : name
+        }),
+      ])
+    }
+  }
+
+  // 512 柜台：独立块，不计入大厅岗位
+  for (const post of data.posts.filter((p) => p.separate)) {
+    const slotCount = Math.max(
+      ...dates.map((date) => plans.get(date)!.slotCount.get(post.id) ?? 0),
+      0,
+    )
+    for (let slot = 0; slot < slotCount; slot++) {
+      rows.push([
+        slot === 0 ? post.name : '',
+        ...dates.map((date) => {
+          const plan = plans.get(date)!
+          if (!plan.working) return ''
+          const ids = plan.byPost.get(post.id) ?? []
+          const personId = ids[slot]
+          if (!personId) return ''
+          const name = nameById.get(personId) ?? ''
+          return plan.counterLeaderId === personId ? `${name}★` : name
         }),
       ])
     }
@@ -164,12 +191,6 @@ export function exportPostTableCsv(data: AppData, weekStart: string, filename?: 
   exportCsv(rows, filename ?? `岗位表_${weekStart}.csv`)
 }
 
-function postCapacity(data: AppData, postId: string, date: string): number {
-  const post = data.posts.find((p) => p.id === postId)
-  if (!post) return 0
-  return parseISO(date).getDay() === 6 ? post.saturdayCapacity : post.capacity
-}
-
 /** 一周排班文本，方便直接发到群里 */
 export function weekText(data: AppData, weekStart: string): string {
   const dates: string[] = []
@@ -190,7 +211,8 @@ export function weekText(data: AppData, weekStart: string): string {
         const names = (plan.byPost.get(post.id) ?? [])
           .map((id) => {
             const name = personName.get(id) ?? ''
-            return plan.leaderId === id ? `${name}★` : name
+            const isLeader = plan.leaderId === id || plan.counterLeaderId === id
+            return isLeader ? `${name}★` : name
           })
           .filter(Boolean)
         return names.length ? `${post.name} ${names.join('、')}` : ''
@@ -198,6 +220,9 @@ export function weekText(data: AppData, weekStart: string): string {
       .filter(Boolean)
     if (plan.onLeavePersonIds.length) {
       parts.push(`休假 ${plan.onLeavePersonIds.map((id) => personName.get(id) ?? '').join('、')}`)
+    }
+    if (plan.dutyTeamId) {
+      parts.push(`值班组 ${plan.dutyTeamId}组`)
     }
     lines.push(`${dayLabel(date)}：${parts.join('；') || '无'}`)
   }

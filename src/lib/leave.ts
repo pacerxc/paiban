@@ -1,6 +1,6 @@
 import type { AppData, LeaveRecord, LedgerEntry, LedgerSource } from '../types'
-import { diffDays, parseISO } from './date'
-import { isOnLeave, planDay } from './scheduler'
+import { diffDays, monthDates, parseISO } from './date'
+import { dayState, isOnLeave, planDay } from './scheduler'
 
 /** 两个日期区间重叠的天数（含首尾） */
 export function overlapDays(aStart: string, aEnd: string, bStart: string, bEnd: string): number {
@@ -50,31 +50,29 @@ export const SOURCE_LABEL: Record<LedgerSource, string> = {
 }
 
 /**
- * 值班流水：主班人员在周六上岗 = +1。
+ * 值班流水：值班 1 天 = 轮休额度 +1。
  *
- * 由排班实时推导，而不是写死条目 —— 这样调整排班后额度自动跟着变，
- * 不会因为反复写台账而重复累加。支援组不产生调休额度。
+ * 值班日 = 周六 + 法定调休上班日（按 A/B 值班组上岗的那些天）。
+ * 由排班实时推导，而不是写死条目 —— 调整排班后额度自动跟着变，
+ * 不会因为反复写台账而重复累加。512 柜台人员周六随值班组上岗同样计入。
  */
 export function dutyEntries(data: AppData, dates: string[]): LedgerRow[] {
   const rows: LedgerRow[] = []
   for (const date of dates) {
-    const weekday = parseISO(date).getDay()
-    if (weekday !== 6) continue
+    if (dayState(data, date).type !== 'duty') continue
     const plan = planDay(data, date)
     if (!plan.working) continue
-    for (const post of data.posts) {
-      for (const personId of plan.byPost.get(post.id) ?? []) {
-        const person = data.people.find((p) => p.id === personId)
-        if (!person || person.pool !== 'main') continue
-        rows.push({
-          id: `duty_${date}_${personId}`,
-          personId,
-          date,
-          days: 1,
-          reason: '周六值班',
-          source: 'duty',
-        })
-      }
+    const isSaturday = parseISO(date).getDay() === 6
+    for (const personId of plan.byPerson.keys()) {
+      if (!plan.byPerson.get(personId)) continue
+      rows.push({
+        id: `duty_${date}_${personId}`,
+        personId,
+        date,
+        days: 1,
+        reason: isSaturday ? '周六值班' : '法定假日值班',
+        source: 'duty',
+      })
     }
   }
   return rows
@@ -131,6 +129,23 @@ export function dutySummary(
 export function ledgerDaysForLeave(type: LeaveRecord['type'], days: number): number | null {
   if (type === '调休' || type === '补休') return -days
   return null
+}
+
+/** 上一个月的月份字符串（2026-11 -> 2026-10） */
+export function previousMonth(month: string): string {
+  const [y, m] = month.split('-').map(Number)
+  return m === 1 ? `${y - 1}-12` : `${y}-${String(m - 1).padStart(2, '0')}`
+}
+
+/**
+ * 上个月未用完的轮休额度（已按规则清零，不结转）。
+ *
+ * 规则：轮休额度必须当月用完，月末未使用部分作废。
+ */
+export function expiredQuota(data: AppData, personId: string, month: string): number {
+  const last = previousMonth(month)
+  const dates = monthDates(last)
+  return Math.max(0, ledgerBalance(data, personId, dates))
 }
 
 /** 某人某月是否休假（含调休/年假等所有类型） */
